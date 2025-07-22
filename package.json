@@ -1,0 +1,29 @@
+{
+  "name": "v2t",
+  "version": "1.0.0",
+  "description": "Voice to Terminal tool for macOS",
+  "type": "module",
+  "main": "realtime-transcribe.js",
+  "scripts": {
+    "start": "node realtime-transcribe.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@openai/realtime-api-beta": "github:openai/openai-realtime-api-beta",
+    "openai": "^4.81.0",
+    "node-record-lpcm16": "^1.0.1",
+    "dotenv": "^16.0.3",
+    "ws": "^8.16.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kengonakajima/v2t.git"
+  },
+  "keywords": ["speech-recognition", "openai", "realtime-api", "macos"],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/kengonakajima/v2t/issues"
+  },
+  "homepage": "https://github.com/kengonakajima/v2t#readme"
+}
