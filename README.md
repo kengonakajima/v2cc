@@ -11,6 +11,13 @@ OpenAIのリアルタイムAPIで音声認識し、最も手前のターミナ�
 その場合は、認識結果がログ出力されません
 
 
+## 仕組み
+sox経由でマイクからlpcm16音声を取り込み、
+OpenAI Realtime APIにWebSocketで送り、
+戻ってきたものを osascriptで実装したmacOSの専用スクリプトで
+ウインドウリストを探索して claudeを発見したら tell, keystrokeで送信します。
+
+
 ## 実行時のログの例
 
 ```
