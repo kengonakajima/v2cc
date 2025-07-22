@@ -6,6 +6,10 @@
 OpenAIのリアルタイムAPIで音声認識し、最も手前のターミナルウインドウ
 で動いているClaude Codeに対して認識結果を送ります。
 
+
+問題: OpenAIのクレジットが切れてるときにエラーを表示できない場合があります。
+
+
 ## セットアップ
 
 ```bash
@@ -17,7 +21,7 @@ echo "OPENAI_API_KEY=sk-xxx" > .env
 ## 実行する
 
 ```bash
-node realtime-transcribe.js
+node v2cc.js
 ```
 
 ## 特殊コマンド
