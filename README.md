@@ -22,6 +22,8 @@ OpenAI Realtime APIにWebSocketで送り、
 
 ## 実行時のログの例
 
+![実行時の画面](capture.png)
+
 ```
 
 [@mbp2021 v2cc]$ npm start
