@@ -41,7 +41,7 @@ EOF
     exit 0
 fi
 
-if [[ "$TEXT_CLEAN" == "やめます" ]] || [[ "$TEXT_CLEAN" == "キャンセルします" ]]; then
+if [[ "$TEXT_CLEAN" == "やめます" ]] || [[ "$TEXT_CLEAN" == "キャンセルします。" ]] || [[ "$TEXT_CLEAN" == "クリアします。" ]]; then
     # Ctrl+Cを送信
     osascript <<'EOF'
 tell application "Terminal"
