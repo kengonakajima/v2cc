@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "description": "Voice to Terminal tool for macOS",
   "type": "module",
-  "main": "realtime-transcribe.js",
+  "main": "v2cc.js",
   "scripts": {
-    "start": "node realtime-transcribe.js",
+    "start": "node v2cc.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
