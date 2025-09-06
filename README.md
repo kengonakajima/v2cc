@@ -71,3 +71,6 @@ Ctrl-Cを送ると、入力中のテキストを全部消せます。
 - macOS 10.15+
 - Node.js 18+
 - OpenAI API key
+
+## ライセンス
+MIT

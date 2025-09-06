@@ -44,7 +44,7 @@ EOF
 fi
 
 # キャンセルコマンド（日本語・英語両対応）
-if [[ "$TEXT_CLEAN" == "やめます" ]] || [[ "$TEXT_CLEAN" == "キャンセルします" ]] || [[ "$TEXT_CLEAN" == "cancel" ]] || [[ "$TEXT_CLEAN" == "Cancel" ]]; then
+if [[ "$TEXT_CLEAN" == "やめます" ]] || [[ "$TEXT_CLEAN" == "キャンセルします" ]] || [[ "$TEXT_CLEAN" == "キャンセルします。" ]] || [[ "$TEXT_CLEAN" == "クリアします。" ]] || [[ "$TEXT_CLEAN" == "cancel" ]] || [[ "$TEXT_CLEAN" == "Cancel" ]]; then
     # Ctrl+Cを送信
     osascript <<'EOF'
 tell application "Terminal"
