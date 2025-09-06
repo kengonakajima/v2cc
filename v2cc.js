@@ -52,12 +52,12 @@ if (!OPENAI_API_KEY || OPENAI_API_KEY=='') {
 // テキストをターミナルに送信する関数
 async function sendToTerminal(text) {
   try {
-    const scriptPath = path.join(__dirname, 'send_to_claude.sh');
+    const scriptPath = path.join(__dirname, 'send_to_terminals.sh');
     if (fs.existsSync(scriptPath)) {
       await execAsync(`"${scriptPath}" "${text}"`);
       console.log(`✓ Sent: ${text}`);
     } else {
-      console.error('Error: send_to_claude.sh not found');
+      console.error('Error: send_to_terminals.sh not found');
     }
   } catch (error) {
     console.error('Error sending to terminal:', error);
