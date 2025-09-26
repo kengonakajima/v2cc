@@ -24,6 +24,20 @@ const VOLUME_SILENT_THRESHOLD_DB = -60;
 const VOLUME_BAR_LENGTH = 20;
 const MESSAGE_MAX_LENGTH = 60;
 
+const TRAILING_PUNCTUATION_REGEX = /[。．\.?!！？、，]$/u;
+const LATIN_ENDING_REGEX = /[A-Za-z0-9]$/;
+
+function ensureTrailingPunctuation(text) {
+  if (!text) return text;
+  const trimmed = text.trim();
+  if (!trimmed) return trimmed;
+  if (TRAILING_PUNCTUATION_REGEX.test(trimmed.slice(-1))) {
+    return trimmed;
+  }
+  const suffix = LATIN_ENDING_REGEX.test(trimmed.slice(-1)) ? '.' : '。';
+  return `${trimmed}${suffix}`;
+}
+
 const MODE_SEQUENCE = ['off', 'detect', 'active'];
 const MODE_LABELS = {
   off: '{red-fg}OFF{/red-fg}',
@@ -423,22 +437,24 @@ async function main() {
       return;
     }
 
+    const finalized = ensureTrailingPunctuation(normalized);
+
     if (state.mode === 'active') {
       updatePartialTranscript('');
     } else {
-      updatePartialTranscript(normalized);
+      updatePartialTranscript(finalized);
     }
 
     if (state.mode === 'active' && state.targetIndex !== -1) {
       const target = state.targets[state.targetIndex];
       try {
-        await sendToTarget(target.id, normalized);
-        ui.setMessage(`送信 (${target.label}): ${truncateForMessage(normalized)}`);
+        await sendToTarget(target.id, finalized);
+        ui.setMessage(`送信 (${target.label}): ${truncateForMessage(finalized)}`);
       } catch (error) {
         ui.setMessage(`送信失敗 (${target.label}): ${error.message}`);
       }
     } else {
-      ui.setMessage(`転写: ${truncateForMessage(normalized)}`);
+      ui.setMessage(`転写: ${truncateForMessage(finalized)}`);
     }
   }
 

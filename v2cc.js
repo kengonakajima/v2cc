@@ -19,6 +19,20 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let audioBuffer = [];
 let lastVolumeDisplay = Date.now();
 
+const TRAILING_PUNCTUATION_REGEX = /[。．\.?!！？、，]$/u;
+const LATIN_ENDING_REGEX = /[A-Za-z0-9]$/;
+
+function ensureTrailingPunctuation(text) {
+  if (!text) return text;
+  const trimmed = text.trim();
+  if (!trimmed) return trimmed;
+  if (TRAILING_PUNCTUATION_REGEX.test(trimmed.slice(-1))) {
+    return trimmed;
+  }
+  const suffix = LATIN_ENDING_REGEX.test(trimmed.slice(-1)) ? '.' : '。';
+  return `${trimmed}${suffix}`;
+}
+
 // PCM16データからデシベル値を計算する関数
 function calculateDecibels(buffer) {
   if (buffer.length === 0) return -Infinity;
@@ -199,10 +213,11 @@ async function main() {
     if (message.type === 'conversation.item.input_audio_transcription.completed') {
       const transcript = message.transcript;
       if (transcript && transcript.trim()) {
+        const finalized = ensureTrailingPunctuation(transcript);
         // 音声レベル表示をクリアして、転写結果を表示
         process.stdout.write('\r' + ' '.repeat(50) + '\r');
-        console.log(`Transcribed: ${transcript}`);
-        await sendToTerminal(transcript);
+        console.log(`Transcribed: ${finalized}`);
+        await sendToTerminal(finalized);
       }
     }
     
