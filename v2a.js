@@ -24,6 +24,14 @@ const VOLUME_SILENT_THRESHOLD_DB = -60;
 const VOLUME_BAR_LENGTH = 20;
 const MESSAGE_MAX_LENGTH = 60;
 
+const MODE_SEQUENCE = ['off', 'detect', 'active'];
+const MODE_LABELS = {
+  off: '{red-fg}OFF{/red-fg}',
+  detect: '{yellow-fg}DETECT{/yellow-fg}',
+  active: '{green-fg}ACTIVE{/green-fg}',
+};
+const PARTIAL_STAGE_HINTS = new Set(['partial', 'delta', 'updated', 'created', 'in_progress']);
+
 const FINAL_STAGE_HINTS = new Set(['completed', 'complete', 'final', 'finished', 'done']);
 
 function extractTranscript(message) {
@@ -174,7 +182,7 @@ function createUI(handlers = {}) {
     top: 5,
     left: 1,
     width: '100%-2',
-    content: '[Enter] ON/OFF   ←/↑ 前   →/↓ 次   r:更新   q:終了',
+    content: '[Enter] 状態切替 (OFF→Detect→Active)   ←/↑ 前   →/↓ 次   r:更新   q:終了',
   });
 
   frame.append(statusLine);
@@ -196,8 +204,8 @@ function createUI(handlers = {}) {
 
   return {
     screen,
-    setStatus(enabled) {
-      const label = enabled ? '{green-fg}ON{/green-fg}' : '{red-fg}OFF{/red-fg}';
+    setStatus(mode) {
+      const label = MODE_LABELS[mode] ?? (mode ? mode.toUpperCase() : '{red-fg}OFF{/red-fg}');
       statusLine.setContent(`Status: ${label}`);
       screen.render();
     },
@@ -256,7 +264,7 @@ async function main() {
   await ensurePrerequisites();
 
   const state = {
-    sendEnabled: false,
+    mode: 'off',
     targets: [],
     targetIndex: -1,
     partialText: '',
@@ -307,10 +315,9 @@ async function main() {
       state.targetIndex = -1;
     }
 
-    if (state.targetIndex === -1 && state.sendEnabled) {
-      state.sendEnabled = false;
-      updateStatusLine();
-      message = '送信先がなくなったため送信を停止しました';
+    if (state.targetIndex === -1 && state.mode === 'active') {
+      applyMode('detect');
+      message = '送信先がなくなったため解析モードに戻りました';
     }
 
     updateSendToLine();
@@ -327,7 +334,33 @@ async function main() {
   }
 
   function updateStatusLine() {
-    ui.setStatus(state.sendEnabled);
+    ui.setStatus(state.mode);
+  }
+
+  function applyMode(newMode, message) {
+    if (!MODE_SEQUENCE.includes(newMode)) {
+      return false;
+    }
+    if (newMode === 'active') {
+      if (!state.targets.length || state.targetIndex === -1) {
+        return false;
+      }
+    }
+    if (state.mode === newMode) {
+      if (message) {
+        ui.setMessage(message);
+      }
+      return true;
+    }
+    state.mode = newMode;
+    updateStatusLine();
+    if (newMode === 'off' || newMode === 'active') {
+      updatePartialTranscript('');
+    }
+    if (message) {
+      ui.setMessage(message);
+    }
+    return true;
   }
 
   function updateSendToLine() {
@@ -352,28 +385,32 @@ async function main() {
   }
 
   function handleToggle() {
-    if (state.sendEnabled) {
-      state.sendEnabled = false;
-      updateStatusLine();
-      ui.setMessage('送信を停止しました');
-      return;
+    const currentIndex = MODE_SEQUENCE.indexOf(state.mode);
+    const nextIndex = (currentIndex + 1) % MODE_SEQUENCE.length;
+    let candidate = MODE_SEQUENCE[nextIndex];
+    let message = null;
+
+    if (candidate === 'active') {
+      if (!state.targets.length) {
+        candidate = 'off';
+        message = '送信先候補がないためOFFに戻りました';
+      } else if (state.targetIndex === -1) {
+        candidate = 'off';
+        message = '送信先を選択してください (矢印キー)。OFFに戻ります';
+      } else {
+        message = `送信を開始します: ${state.targets[state.targetIndex].label}`;
+      }
+    } else if (candidate === 'detect') {
+      message = '解析モードに切り替えました';
+    } else {
+      message = '送信を停止しました';
     }
-    if (!state.targets.length) {
-      ui.setMessage('送信先候補がありません');
-      return;
-    }
-    if (state.targetIndex === -1) {
-      ui.setMessage('送信先を選択してください (矢印キー)');
-      return;
-    }
-    state.sendEnabled = true;
-    updateStatusLine();
-    const target = state.targets[state.targetIndex];
-    ui.setMessage(`送信を開始します: ${target.label}`);
+
+    applyMode(candidate, message);
   }
 
   function updatePartialTranscript(raw) {
-    const text = typeof raw === 'string' ? raw : '';
+    const text = state.mode === 'off' ? '' : typeof raw === 'string' ? raw : '';
     if (text !== state.partialText) {
       state.partialText = text;
       ui.setDetected(text);
@@ -386,9 +423,13 @@ async function main() {
       return;
     }
 
-    updatePartialTranscript(normalized);
+    if (state.mode === 'active') {
+      updatePartialTranscript('');
+    } else {
+      updatePartialTranscript(normalized);
+    }
 
-    if (state.sendEnabled && state.targetIndex !== -1) {
+    if (state.mode === 'active' && state.targetIndex !== -1) {
       const target = state.targets[state.targetIndex];
       try {
         await sendToTarget(target.id, normalized);
@@ -400,8 +441,6 @@ async function main() {
       ui.setMessage(`転写: ${truncateForMessage(normalized)}`);
     }
   }
-
-  const PARTIAL_STAGE_HINTS = new Set(['partial', 'delta', 'updated', 'created', 'in_progress']);
 
   async function processTranscriptPayload(transcript, stageHint) {
     const text = typeof transcript === 'string' ? transcript : '';
@@ -611,7 +650,7 @@ async function main() {
       lastVolumeDisplay = now;
     }
 
-    if (ws?.readyState === WebSocket.OPEN) {
+    if (state.mode !== 'off' && ws?.readyState === WebSocket.OPEN) {
       ws.send(
         JSON.stringify({
           type: 'input_audio_buffer.append',
