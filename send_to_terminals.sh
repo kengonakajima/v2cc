@@ -13,6 +13,17 @@ TEXT_CLEAN="${TEXT_CLEAN%.}"
 if [[ "$TEXT_CLEAN" == "実行" ]] || [[ "$TEXT_CLEAN" == "Enter" ]] || [[ "$TEXT_CLEAN" == "enter" ]]; then
     # Enterキーを直接送信
     osascript <<'EOF'
+-- まずObsidianをチェック
+tell application "System Events"
+    if exists (processes where name is "Obsidian") then
+        tell process "Obsidian"
+            set frontmost to true
+            key code 36 -- Return key
+        end tell
+        return "EnterキーをObsidianに送信しました"
+    end if
+end tell
+
 tell application "Terminal"
     -- claudeコマンドを実行しているウィンドウを探す
     repeat with win in windows
@@ -29,7 +40,7 @@ tell application "Terminal"
             end if
         end repeat
     end repeat
-    
+
     -- claudeが見つからない場合は最前面のターミナルに送信
     if (count of windows) > 0 then
         tell application "System Events"
@@ -47,6 +58,17 @@ fi
 if [[ "$TEXT_CLEAN" == "やめます" ]] || [[ "$TEXT_CLEAN" == "キャンセルします" ]] || [[ "$TEXT_CLEAN" == "キャンセルします。" ]] || [[ "$TEXT_CLEAN" == "クリアします。" ]] || [[ "$TEXT_CLEAN" == "cancel" ]] || [[ "$TEXT_CLEAN" == "Cancel" ]]; then
     # Ctrl+Cを送信
     osascript <<'EOF'
+-- まずObsidianをチェック
+tell application "System Events"
+    if exists (processes where name is "Obsidian") then
+        tell process "Obsidian"
+            set frontmost to true
+            keystroke "c" using control down
+        end tell
+        return "Ctrl+CをObsidianに送信しました"
+    end if
+end tell
+
 tell application "Terminal"
     -- claudeコマンドを実行しているウィンドウを探す
     repeat with win in windows
@@ -63,7 +85,7 @@ tell application "Terminal"
             end if
         end repeat
     end repeat
-    
+
     -- claudeが見つからない場合は最前面のターミナルに送信
     if (count of windows) > 0 then
         tell application "System Events"
@@ -79,6 +101,23 @@ fi
 
 # 通常のテキストの場合はクリップボード経由で送信
 echo -n "$TEXT" | pbcopy
+
+# Obsidian用の送信関数
+send_to_obsidian() {
+    osascript <<'EOF'
+tell application "System Events"
+    if exists (processes where name is "Obsidian") then
+        tell process "Obsidian"
+            set frontmost to true
+            keystroke "v" using command down
+        end tell
+        return "Obsidianに送信しました"
+    else
+        return "Obsidianが見つかりませんでした"
+    end if
+end tell
+EOF
+}
 
 # Claude用の送信関数
 send_to_claude() {
@@ -138,15 +177,20 @@ end tell
 EOF
 }
 
-# 両方に送信
-claude_result=$(send_to_claude)
-codex_result=$(send_to_codex)
+# 優先順位: Obsidian > Claude > Codex > 最前面のターミナル
+obsidian_result=$(send_to_obsidian)
 
-echo "Claude: $claude_result"
-echo "Codex: $codex_result"
+if [[ "$obsidian_result" == *"見つかりませんでした"* ]]; then
+    # Obsidianが見つからない場合、Claude、Codexに送信
+    claude_result=$(send_to_claude)
+    codex_result=$(send_to_codex)
 
-# どちらも見つからない場合は最前面のターミナルに送信
-if [[ "$claude_result" == *"見つかりませんでした"* ]] && [[ "$codex_result" == *"見つかりませんでした"* ]]; then
+    echo "Obsidian: $obsidian_result"
+    echo "Claude: $claude_result"
+    echo "Codex: $codex_result"
+
+    # どちらも見つからない場合は最前面のターミナルに送信
+    if [[ "$claude_result" == *"見つかりませんでした"* ]] && [[ "$codex_result" == *"見つかりませんでした"* ]]; then
     osascript <<'EOF'
 tell application "Terminal"
     if (count of windows) > 0 then
@@ -159,7 +203,11 @@ tell application "Terminal"
     end if
 end tell
 EOF
-    echo "フォールバック: 最前面のターミナルに送信"
+        echo "フォールバック: 最前面のターミナルに送信"
+    fi
+else
+    # Obsidianに送信できた場合
+    echo "Obsidian: $obsidian_result"
 fi
 
 echo "送信完了: $TEXT"
