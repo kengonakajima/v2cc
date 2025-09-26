@@ -6,19 +6,26 @@
   "main": "v2cc.js",
   "scripts": {
     "start": "node v2cc.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start:tui": "node v2a.js"
   },
   "dependencies": {
     "openai": "^4.81.0",
     "node-record-lpcm16": "^1.0.1",
     "dotenv": "^16.0.3",
-    "ws": "^8.16.0"
+    "ws": "^8.16.0",
+    "blessed": "^0.1.81"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/kengonakajima/v2t.git"
   },
-  "keywords": ["speech-recognition", "openai", "realtime-api", "macos"],
+  "keywords": [
+    "speech-recognition",
+    "openai",
+    "realtime-api",
+    "macos"
+  ],
   "author": "",
   "license": "ISC",
   "bugs": {
