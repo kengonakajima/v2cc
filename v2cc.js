@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import 'dotenv/config';
-import { RealtimeClient } from '@openai/realtime-api-beta';
 import WebSocket from 'ws';
 import { exec } from 'child_process';
 import { promisify } from 'util';
