@@ -287,6 +287,7 @@ async function main() {
 
   let ws;
   let mic;
+  let micStream;
   let targetInterval;
   let audioBuffer = [];
   let lastVolumeDisplay = Date.now();
@@ -351,6 +352,78 @@ async function main() {
     ui.setStatus(state.mode);
   }
 
+  function handleMicData(chunk) {
+    audioBuffer.push(chunk);
+    const now = Date.now();
+    if (now - lastVolumeDisplay >= VOLUME_UPDATE_INTERVAL_MS) {
+      const combined = Buffer.concat(audioBuffer);
+      const db = calculateDecibels(combined);
+      ui.setVolume(db);
+      audioBuffer = [];
+      lastVolumeDisplay = now;
+    }
+
+    if (state.mode !== 'off' && ws?.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: 'input_audio_buffer.append',
+          audio: chunk.toString('base64'),
+        })
+      );
+    }
+  }
+
+  function handleMicError(error) {
+    ui.setMessage(`マイクエラー: ${error.message}`);
+  }
+
+  function startMic() {
+    if (mic) return;
+    try {
+      mic = record.record({
+        sampleRate: 24000,
+        channels: 1,
+        audioType: 'raw',
+        threshold: 0,
+        silence: '10.0',
+        recordProgram: 'sox',
+      });
+    } catch (error) {
+      ui.setMessage(`マイク開始失敗: ${error.message}`);
+      cleanup(1);
+      return;
+    }
+
+    micStream = mic.stream();
+    micStream.on('data', handleMicData);
+    micStream.on('error', handleMicError);
+    audioBuffer = [];
+    lastVolumeDisplay = Date.now();
+    try {
+      ui.setVolume(-Infinity);
+    } catch (_) {}
+  }
+
+  function stopMic() {
+    if (!mic) return;
+    if (micStream) {
+      micStream.removeListener('data', handleMicData);
+      micStream.removeListener('error', handleMicError);
+      micStream = null;
+    }
+    try {
+      mic.stop();
+    } catch (error) {
+      // ignore stop errors
+    }
+    mic = null;
+    audioBuffer = [];
+    lastVolumeDisplay = Date.now();
+    try {
+      ui.setVolume(-Infinity);
+    } catch (_) {}
+  }
+
   function applyMode(newMode, message) {
     if (!MODE_SEQUENCE.includes(newMode)) {
       return false;
@@ -368,6 +441,11 @@ async function main() {
     }
     state.mode = newMode;
     updateStatusLine();
+    if (state.mode === 'off') {
+      stopMic();
+    } else {
+      startMic();
+    }
     if (newMode === 'off' || newMode === 'active') {
       updatePartialTranscript('');
     }
@@ -557,13 +635,7 @@ async function main() {
     if (state.closing) return;
     state.closing = true;
     if (targetInterval) clearInterval(targetInterval);
-    if (mic) {
-      try {
-        mic.stop();
-      } catch (error) {
-        // ignore stop errors
-      }
-    }
+    stopMic();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.close();
     }
@@ -637,48 +709,7 @@ async function main() {
     })
   );
 
-  try {
-    mic = record.record({
-      sampleRate: 24000,
-      channels: 1,
-      audioType: 'raw',
-      threshold: 0,
-      silence: '10.0',
-      recordProgram: 'sox',
-    });
-  } catch (error) {
-    ui.setMessage(`マイク開始失敗: ${error.message}`);
-    await cleanup(1);
-    return;
-  }
-
-  const micStream = mic.stream();
-  ui.setMessage('音声入力待機中...');
-
-  micStream.on('data', (chunk) => {
-    audioBuffer.push(chunk);
-    const now = Date.now();
-    if (now - lastVolumeDisplay >= VOLUME_UPDATE_INTERVAL_MS) {
-      const combined = Buffer.concat(audioBuffer);
-      const db = calculateDecibels(combined);
-      ui.setVolume(db);
-      audioBuffer = [];
-      lastVolumeDisplay = now;
-    }
-
-    if (state.mode !== 'off' && ws?.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: 'input_audio_buffer.append',
-          audio: chunk.toString('base64'),
-        })
-      );
-    }
-  });
-
-  micStream.on('error', (error) => {
-    ui.setMessage(`マイクエラー: ${error.message}`);
-  });
+  ui.setMessage('現在はOFFモードです。[Enter]で検出を開始できます');
 
   targetInterval = setInterval(() => {
     refreshTargets().catch((error) => {
