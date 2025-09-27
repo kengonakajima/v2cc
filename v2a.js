@@ -20,12 +20,41 @@ const SCREEN_LABEL = ' V2A ';
 const DETECTED_MAX_DISPLAY = 60;
 const TARGET_REFRESH_INTERVAL_MS = 5000;
 const VOLUME_UPDATE_INTERVAL_MS = 500;
+const SEND_COUNT_UPDATE_INTERVAL_MS = 500;
 const VOLUME_SILENT_THRESHOLD_DB = -60;
 const VOLUME_BAR_LENGTH = 20;
 const MESSAGE_MAX_LENGTH = 60;
 
 const TRAILING_PUNCTUATION_REGEX = /[。．\.?!！？、，]$/u;
 const LATIN_ENDING_REGEX = /[A-Za-z0-9]$/;
+const POLITE_BASE_ENDINGS = [
+  'です',
+  'でした',
+  'でしょう',
+  'でしょ',
+  'ます',
+  'ました',
+  'ません',
+  'ませんでした',
+];
+const POLITE_SUFFIXES = ['ね', 'よ', 'よね'];
+const POLITE_QUESTION_SUFFIXES = ['か', 'かね', 'かしら'];
+const JAPANESE_POLITE_ENDINGS = new Set([
+  ...POLITE_BASE_ENDINGS,
+  ...POLITE_BASE_ENDINGS.flatMap((base) => [
+    ...POLITE_SUFFIXES.map((suffix) => `${base}${suffix}`),
+    ...POLITE_QUESTION_SUFFIXES.map((suffix) => `${base}${suffix}`),
+  ]),
+]);
+
+function hasJapanesePoliteEnding(text) {
+  for (const ending of JAPANESE_POLITE_ENDINGS) {
+    if (text.endsWith(ending)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function ensureTrailingPunctuation(text) {
   if (!text) return text;
@@ -34,8 +63,13 @@ function ensureTrailingPunctuation(text) {
   if (TRAILING_PUNCTUATION_REGEX.test(trimmed.slice(-1))) {
     return trimmed;
   }
-  const suffix = LATIN_ENDING_REGEX.test(trimmed.slice(-1)) ? '.' : '。';
-  return `${trimmed}${suffix}`;
+  if (hasJapanesePoliteEnding(trimmed)) {
+    return `${trimmed}。`;
+  }
+  if (LATIN_ENDING_REGEX.test(trimmed.slice(-1))) {
+    return `${trimmed}.`;
+  }
+  return trimmed;
 }
 
 const MODE_SEQUENCE = ['off', 'detect', 'active'];
@@ -176,7 +210,7 @@ function createUI(handlers = {}) {
     top: 'center',
     left: 'center',
     width: '80%',
-    height: 9,
+    height: 10,
     border: { type: 'line' },
     label: SCREEN_LABEL,
     tags: true,
@@ -191,9 +225,10 @@ function createUI(handlers = {}) {
   const volumeLine = blessed.text({ top: 1, left: 1, content: 'Volume: [                    ] Silent' });
   const detectedLine = blessed.text({ top: 2, left: 1, content: 'Detected: ' });
   const sendToLine = blessed.text({ top: 3, left: 1, content: 'Send To: 未設定' });
-  const messageLine = blessed.text({ top: 4, left: 1, width: '100%-2', content: '' });
+  const sendCountLine = blessed.text({ top: 4, left: 1, content: '送信回数: 0' });
+  const messageLine = blessed.text({ top: 5, left: 1, width: '100%-2', content: '' });
   const helpLine = blessed.text({
-    top: 5,
+    top: 6,
     left: 1,
     width: '100%-2',
     content: '[Enter] 状態切替 (OFF→Detect→Active)   ←/↑ 前   →/↓ 次   r:更新   q:終了',
@@ -203,6 +238,7 @@ function createUI(handlers = {}) {
   frame.append(volumeLine);
   frame.append(detectedLine);
   frame.append(sendToLine);
+  frame.append(sendCountLine);
   frame.append(messageLine);
   frame.append(helpLine);
   screen.append(frame);
@@ -233,6 +269,10 @@ function createUI(handlers = {}) {
     },
     setSendTo(label) {
       sendToLine.setContent(`Send To: ${label ?? '未設定'}`);
+      screen.render();
+    },
+    setSendCount(count) {
+      sendCountLine.setContent(`送信回数: ${count}`);
       screen.render();
     },
     setMessage(message) {
@@ -283,6 +323,7 @@ async function main() {
     targetIndex: -1,
     partialText: '',
     closing: false,
+    sendCount: 0,
   };
 
   let ws;
@@ -291,6 +332,7 @@ async function main() {
   let targetInterval;
   let audioBuffer = [];
   let lastVolumeDisplay = Date.now();
+  let lastSendCountDisplay = Date.now();
 
   const ui = createUI({
     toggle: handleToggle,
@@ -301,6 +343,8 @@ async function main() {
   });
 
   ui.setMessage('送信先を取得しています...');
+  ui.setSendCount(state.sendCount);
+  lastSendCountDisplay = Date.now();
 
   async function refreshTargets(showMessage = false) {
     const prevTargets = state.targets;
@@ -370,6 +414,11 @@ async function main() {
           audio: chunk.toString('base64'),
         })
       );
+      state.sendCount += 1;
+      if (now - lastSendCountDisplay >= SEND_COUNT_UPDATE_INTERVAL_MS) {
+        ui.setSendCount(state.sendCount);
+        lastSendCountDisplay = now;
+      }
     }
   }
 
@@ -443,6 +492,9 @@ async function main() {
     updateStatusLine();
     if (state.mode === 'off') {
       stopMic();
+      state.sendCount = 0;
+      ui.setSendCount(state.sendCount);
+      lastSendCountDisplay = Date.now();
     } else {
       startMic();
     }

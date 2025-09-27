@@ -21,6 +21,34 @@ let lastVolumeDisplay = Date.now();
 
 const TRAILING_PUNCTUATION_REGEX = /[。．\.?!！？、，]$/u;
 const LATIN_ENDING_REGEX = /[A-Za-z0-9]$/;
+const POLITE_BASE_ENDINGS = [
+  'です',
+  'でした',
+  'でしょう',
+  'でしょ',
+  'ます',
+  'ました',
+  'ません',
+  'ませんでした',
+];
+const POLITE_SUFFIXES = ['ね', 'よ', 'よね'];
+const POLITE_QUESTION_SUFFIXES = ['か', 'かね', 'かしら'];
+const JAPANESE_POLITE_ENDINGS = new Set([
+  ...POLITE_BASE_ENDINGS,
+  ...POLITE_BASE_ENDINGS.flatMap((base) => [
+    ...POLITE_SUFFIXES.map((suffix) => `${base}${suffix}`),
+    ...POLITE_QUESTION_SUFFIXES.map((suffix) => `${base}${suffix}`),
+  ]),
+]);
+
+function hasJapanesePoliteEnding(text) {
+  for (const ending of JAPANESE_POLITE_ENDINGS) {
+    if (text.endsWith(ending)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function ensureTrailingPunctuation(text) {
   if (!text) return text;
@@ -29,8 +57,13 @@ function ensureTrailingPunctuation(text) {
   if (TRAILING_PUNCTUATION_REGEX.test(trimmed.slice(-1))) {
     return trimmed;
   }
-  const suffix = LATIN_ENDING_REGEX.test(trimmed.slice(-1)) ? '.' : '。';
-  return `${trimmed}${suffix}`;
+  if (hasJapanesePoliteEnding(trimmed)) {
+    return `${trimmed}。`;
+  }
+  if (LATIN_ENDING_REGEX.test(trimmed.slice(-1))) {
+    return `${trimmed}.`;
+  }
+  return trimmed;
 }
 
 // PCM16データからデシベル値を計算する関数
