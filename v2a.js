@@ -21,6 +21,9 @@ const DETECTED_MAX_DISPLAY = 60;
 const TARGET_REFRESH_INTERVAL_MS = 5000;
 const VOLUME_UPDATE_INTERVAL_MS = 500;
 const SEND_COUNT_UPDATE_INTERVAL_MS = 500;
+const DETECT_AUTO_OFF_TIMEOUT_MS = 3 * 60 * 1000;
+const TRANSCRIPT_AUTO_OFF_TIMEOUT_MS = 5 * 60 * 1000;
+const STATUS_COUNTDOWN_UPDATE_INTERVAL_MS = 1000;
 const VOLUME_SILENT_THRESHOLD_DB = -60;
 const VOLUME_BAR_LENGTH = 20;
 const MESSAGE_MAX_LENGTH = 60;
@@ -254,9 +257,10 @@ function createUI(handlers = {}) {
 
   return {
     screen,
-    setStatus(mode) {
+    setStatus(mode, extra) {
       const label = MODE_LABELS[mode] ?? (mode ? mode.toUpperCase() : '{red-fg}OFF{/red-fg}');
-      statusLine.setContent(`Status: ${label}`);
+      const suffix = extra ? ` ${extra}` : '';
+      statusLine.setContent(`Status: ${label}${suffix}`);
       screen.render();
     },
     setVolume(db) {
@@ -324,12 +328,17 @@ async function main() {
     partialText: '',
     closing: false,
     sendCount: 0,
+    detectModeExpiresAt: null,
+    transcriptTimeoutExpiresAt: null,
   };
 
   let ws;
   let mic;
   let micStream;
   let targetInterval;
+  let detectAutoOffTimer;
+  let transcriptAutoOffTimer;
+  let statusCountdownInterval;
   let audioBuffer = [];
   let lastVolumeDisplay = Date.now();
   let lastSendCountDisplay = Date.now();
@@ -392,8 +401,24 @@ async function main() {
     }
   }
 
+  function formatRemainingTime(expiresAt) {
+    const remainingMs = Math.max(0, expiresAt - Date.now());
+    const remainingSeconds = Math.ceil(remainingMs / 1000);
+    const minutes = Math.floor(remainingSeconds / 60);
+    const seconds = remainingSeconds % 60;
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+  }
+
   function updateStatusLine() {
-    ui.setStatus(state.mode);
+    const extras = [];
+    if (state.mode === 'detect' && typeof state.detectModeExpiresAt === 'number') {
+      extras.push(`残り ${formatRemainingTime(state.detectModeExpiresAt)}`);
+    }
+    if (state.mode !== 'off' && typeof state.transcriptTimeoutExpiresAt === 'number') {
+      extras.push(`無入力 ${formatRemainingTime(state.transcriptTimeoutExpiresAt)}`);
+    }
+    const extraText = extras.length ? `(${extras.join(' / ')})` : '';
+    ui.setStatus(state.mode, extraText);
   }
 
   function handleMicData(chunk) {
@@ -473,6 +498,72 @@ async function main() {
     } catch (_) {}
   }
 
+  function ensureStatusCountdownInterval() {
+    if (!statusCountdownInterval) {
+      statusCountdownInterval = setInterval(() => {
+        updateStatusLine();
+      }, STATUS_COUNTDOWN_UPDATE_INTERVAL_MS);
+    }
+  }
+
+  function stopStatusCountdownIntervalIfIdle() {
+    if (!detectAutoOffTimer && !transcriptAutoOffTimer && statusCountdownInterval) {
+      clearInterval(statusCountdownInterval);
+      statusCountdownInterval = null;
+    }
+  }
+
+  function clearDetectAutoOffTimer() {
+    if (detectAutoOffTimer) {
+      clearTimeout(detectAutoOffTimer);
+      detectAutoOffTimer = null;
+    }
+    state.detectModeExpiresAt = null;
+    stopStatusCountdownIntervalIfIdle();
+  }
+
+  function scheduleDetectAutoOff() {
+    clearDetectAutoOffTimer();
+    state.detectModeExpiresAt = Date.now() + DETECT_AUTO_OFF_TIMEOUT_MS;
+    detectAutoOffTimer = setTimeout(() => {
+      if (state.mode === 'detect') {
+        applyMode('off', 'Detectモードが3分経過したためOFFに戻りました');
+      }
+    }, DETECT_AUTO_OFF_TIMEOUT_MS);
+    ensureStatusCountdownInterval();
+    updateStatusLine();
+  }
+
+  function clearTranscriptAutoOffTimer() {
+    if (transcriptAutoOffTimer) {
+      clearTimeout(transcriptAutoOffTimer);
+      transcriptAutoOffTimer = null;
+    }
+    state.transcriptTimeoutExpiresAt = null;
+    stopStatusCountdownIntervalIfIdle();
+  }
+
+  function scheduleTranscriptAutoOff() {
+    clearTranscriptAutoOffTimer();
+    if (state.mode === 'off') {
+      updateStatusLine();
+      return;
+    }
+    state.transcriptTimeoutExpiresAt = Date.now() + TRANSCRIPT_AUTO_OFF_TIMEOUT_MS;
+    transcriptAutoOffTimer = setTimeout(() => {
+      if (state.mode !== 'off') {
+        applyMode('off', '解析結果が5分間届かなかったためOFFに戻りました');
+      }
+    }, TRANSCRIPT_AUTO_OFF_TIMEOUT_MS);
+    ensureStatusCountdownInterval();
+    updateStatusLine();
+  }
+
+  function noteTranscriptActivity() {
+    if (state.mode === 'off') return;
+    scheduleTranscriptAutoOff();
+  }
+
   function applyMode(newMode, message) {
     if (!MODE_SEQUENCE.includes(newMode)) {
       return false;
@@ -488,15 +579,26 @@ async function main() {
       }
       return true;
     }
+    const previousMode = state.mode;
     state.mode = newMode;
-    updateStatusLine();
     if (state.mode === 'off') {
+      clearDetectAutoOffTimer();
+      clearTranscriptAutoOffTimer();
       stopMic();
       state.sendCount = 0;
       ui.setSendCount(state.sendCount);
       lastSendCountDisplay = Date.now();
     } else {
       startMic();
+      scheduleTranscriptAutoOff();
+    }
+    if (previousMode === 'detect' && state.mode !== 'detect') {
+      clearDetectAutoOffTimer();
+    }
+    if (state.mode === 'detect') {
+      scheduleDetectAutoOff();
+    } else {
+      updateStatusLine();
     }
     if (newMode === 'off' || newMode === 'active') {
       updatePartialTranscript('');
@@ -593,11 +695,15 @@ async function main() {
     const stage = typeof stageHint === 'string' ? stageHint.toLowerCase() : '';
     if (FINAL_STAGE_HINTS.has(stage)) {
       await handleFinalTranscript(text);
+      if (text) {
+        noteTranscriptActivity();
+      }
       return true;
     }
 
     if (text) {
       updatePartialTranscript(text);
+      noteTranscriptActivity();
       return true;
     }
 
@@ -663,6 +769,7 @@ async function main() {
       const transcript = extractTranscript(message);
       if (transcript) {
         updatePartialTranscript(transcript);
+        noteTranscriptActivity();
         return true;
       }
       if (Array.isArray(message.delta?.items)) {
@@ -686,6 +793,8 @@ async function main() {
   async function cleanup(exitCode = 0) {
     if (state.closing) return;
     state.closing = true;
+    clearDetectAutoOffTimer();
+    clearTranscriptAutoOffTimer();
     if (targetInterval) clearInterval(targetInterval);
     stopMic();
     if (ws && ws.readyState === WebSocket.OPEN) {
