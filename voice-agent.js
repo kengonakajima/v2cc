@@ -8,6 +8,9 @@ import path from 'path';
 import process from 'process';
 import OpenAI from 'openai';
 import { getToolDefinitions, routeToolCall } from './tool-router.js';
+import { AudioPlayer } from './audio-player.js';
+import { TtsClient } from './tts-client.js';
+import { PlaybackQueue } from './playback-queue.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,6 +20,8 @@ if (!OPENAI_API_KEY) {
   console.error('OPENAI_API_KEY が設定されていません (.env で指定してください)');
   process.exit(1);
 }
+
+const args = new Set(process.argv.slice(2));
 
 const MODEL_ID = process.env.OPENAI_MODEL ?? 'gpt-5-mini';
 const TRANSCRIBE_PATH = path.join(__dirname, 'transcribe.js');
@@ -29,6 +34,22 @@ const TRANSCRIBE_STATUS_PATTERNS = [
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 const toolDefinitions = getToolDefinitions();
 const hasTools = toolDefinitions.length > 0;
+
+const ttsDisabledFlag = args.has('--no-tts');
+const ttsEnvDisabled = (process.env.VOICE_AGENT_TTS_ENABLED ?? 'true').toLowerCase() === 'false';
+const ttsModel = process.env.VOICE_AGENT_TTS_MODEL ?? 'gpt-4o-mini-tts';
+const ttsVoice = process.env.VOICE_AGENT_TTS_VOICE ?? 'alloy';
+
+let playbackQueue = null;
+if (!ttsDisabledFlag && !ttsEnvDisabled) {
+  try {
+    const audioPlayer = new AudioPlayer();
+    const ttsClient = new TtsClient(client, { model: ttsModel, voice: ttsVoice });
+    playbackQueue = new PlaybackQueue({ audioPlayer, ttsClient, enabled: true });
+  } catch (error) {
+    console.error(`[voice-agent] TTS 初期化に失敗しました: ${error.message}`);
+  }
+}
 
 const conversation = [];
 const pendingUtterances = [];
@@ -46,6 +67,26 @@ addToConversation(createMessage('system', baseSystemPrompt));
 startTranscriber();
 setupSignalHandlers();
 
+function initiateShutdown(code, reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (reason) {
+    console.error(reason);
+  }
+  const finalize = async () => {
+    try {
+      if (playbackQueue) {
+        await playbackQueue.shutdown();
+      }
+    } catch (error) {
+      console.error(`[voice-agent] 終了処理エラー: ${error.message}`);
+    } finally {
+      process.exit(code);
+    }
+  };
+  finalize();
+}
+
 function startTranscriber() {
   console.error('[voice-agent] transcribe.js を起動します');
   const child = spawn(process.execPath, [TRANSCRIBE_PATH], {
@@ -60,8 +101,7 @@ function startTranscriber() {
       return;
     }
     const suffix = signal ? `signal=${signal}` : `code=${code}`;
-    console.error(`[voice-agent] transcribe.js が終了しました (${suffix})`);
-    process.exit(typeof code === 'number' ? code : 1);
+    initiateShutdown(typeof code === 'number' ? code : 1, `[voice-agent] transcribe.js が終了しました (${suffix})`);
   });
 
   process.on('exit', () => {
@@ -71,19 +111,12 @@ function startTranscriber() {
 }
 
 function setupSignalHandlers() {
-  process.on('SIGINT', () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.error('\n[voice-agent] SIGINT を受信しました。終了します');
-    process.exit(0);
-  });
+  const exitHandler = (signal) => {
+    initiateShutdown(0, `\n[voice-agent] ${signal} を受信しました。終了します`);
+  };
 
-  process.on('SIGTERM', () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.error('\n[voice-agent] SIGTERM を受信しました。終了します');
-    process.exit(0);
-  });
+  process.on('SIGINT', () => exitHandler('SIGINT'));
+  process.on('SIGTERM', () => exitHandler('SIGTERM'));
 }
 
 function handleTranscribeLine(rawLine) {
@@ -156,6 +189,7 @@ async function runTurn({ text, timestamp }) {
     textOutputs.forEach((output) => {
       console.log(`[assistant] ${output}`);
       addToConversation(createMessage('assistant', output));
+      playbackQueue?.enqueue({ text: output });
     });
 
     if (!toolCalls.length) {

@@ -1,0 +1,79 @@
+# 音声応答 (TTS) 仕様案
+
+## 1. ゴール
+- `voice-agent.js` が LLM から受け取った最終テキスト応答を、PAmac.node を使ったスピーカ再生まで自動化する。
+- 既存のテキスト出力/ツール呼び出しフローは維持し、音声出力は追加機能として非同期で動作させる。
+- 将来的に Realtime API や音声対話モデル（`gpt-realtime` など）へ移行できるよう、TTS 実装を薄い抽象層で包む。
+
+## 2. TTS モデル選択と API
+### 優先ルート: Text-to-Speech API (`audio/speech`)
+- モデル: `gpt-4o-mini-tts`（2025-03-20 公開、リアルタイム用途向け）。citeturn5search0turn5search3
+- エンドポイント: `client.audio.speech.create({ model, voice, input, format })`。
+- 音声フォーマット: `pcm16`（リトルエンディアン）を指定し、ベース64分割レスポンスをバイナリ復元。
+- ボイス: 既存 6 音声から 1 つ選択（例: `alloy`）。カスタム制御テキスト（スピード・雰囲気）を `input` に含める。
+- レイテンシ: 約 300–500 ms（非ストリーミング）。`stream: true` が必要な場合は chunk 単位で処理。citeturn5search0
+- 長文対応: 4096 文字制限を越える場合は文単位の TTS キューに分割。citeturn5search0
+
+### 代替ルート: Responses API 音声出力
+- モデル: `gpt-realtime` または `gpt-4o` シリーズで `modalities: ['text','audio']` と `audio: { voice, format: 'pcm16' }` を設定。citeturn5search7turn4search2
+- メリット: 音声生成とテキスト生成を単一レスポンスで完結、低レイテンシ。
+- デメリット: 現行のツール呼び出し・テキスト整形ロジックを再構成する必要あり。初期実装ではバックログとし、TTS API での音声出力を優先。
+
+## 3. アーキテクチャ
+```
+voice-agent.js
+ ├─ conversation / tool loop (既存)
+ ├─ responseEmitter.emit('assistant-final-text', payload)
+ └─ playbackQueue.enqueue(payload)
+
+playbackQueue
+ ├─ transforms text -> SSML-ish instruction (optional)
+ ├─ invokes TTS client
+ ├─ PCM Int16 チャンクを生成
+ └─ AudioPlayer.enqueue(samples, sampleRate)
+
+AudioPlayer (新規)
+ ├─ PAmac.node を require して利用可否を検証
+ ├─ PortAudio のバッファを初期化し `startSpeaker` を実行
+ ├─ PCM を `pushSamplesForPlay` で供給
+ └─ キューが空になったらスピーカーを停止 / 再開制御
+```
+- `playbackQueue` は FIFO。TTS 変換と再生は別 worker（非同期関数）で直列化し、重複発話を防ぐ。
+- ツール応答と TTS が競合した場合はテキストのみを優先出力し、音声はスキップ可能なようフラグ（`--mute`）を用意。
+
+## 4. PAmac 再利用指針
+- 参考コード: `v2a.js` の録音周り（`node-record-lpcm16`）。再生は PortAudio(PAmac.node) を利用し、追加の外部プロセスを使わずに再生する。
+- PAmac.node の読み込みに失敗した場合はテキスト応答のみで継続し、ログに警告を出す。
+- TTS 出力は PCM Int16 (24kHz) を前提とし、AudioPlayer 内で 24kHz→16kHz などにリサンプリングする。
+- 音量調整: PCM スケーリングを行い、最大振幅が ±30000 付近になるよう正規化してから PortAudio に渡す。
+
+## 5. 実装ステップ
+1. **共通ユーティリティ**
+   - `ttsClient.js`: OpenAI SDK をラップし、`synthesizeText({ text, voice, format })` を提供。
+   - `audioUtils.js`: base64 → Buffer → Int16Array 変換、16kHz リサンプリング（必要なら SoX CLI で検証）。
+2. **音声再生モジュール**
+   - `audio-player.js`: PortAudio(PAmac.node) のバッファを初期化し、PCM を `pushSamplesForPlay` へプッシュする。
+   - flush ループで順番にブロックを供給し、重複再生を防ぐ。
+3. **voice-agent.js の拡張**
+   - 最終テキスト (`textOutputs`) をログ出力した直後に `playbackQueue.enqueue({ text, metadata })`。
+   - エラーハンドリングは `try/catch` 内でログ＋フォールバック（音声なしで継続）。
+   - `SIGINT` 時に `playbackQueue.shutdown()` を呼び出し、PortAudio(PAmac) の再生プロセスを終了。
+4. **設定項目**
+- `.env`: `VOICE_AGENT_TTS_MODEL=gpt-4o-mini-tts`, `VOICE_AGENT_TTS_VOICE=alloy`, `VOICE_AGENT_TTS_STREAM=true` 等。
+   - CLI フラグ: `--no-tts` で従来挙動。
+5. **テスト計画**
+   - モック音声: API 呼び出しをスタブして既知の PCM を再生。
+   - 実機: 10〜15 秒の会話を実行し、音声遅延とノイズを確認。
+   - 異常系: TTS API レートリミット時にログ＋再試行（指数バックオフ 3 回）。
+
+## 6. エラーハンドリング & 品質
+- ネットワーク障害時はテキストのみ案内（ユーザーへ「音声出力に失敗」と通告）。
+- 多言語サポート: LLM 応答言語を受け取りそのまま TTS に流す。将来的に voice 設定を応答言語に応じて変更。
+- サンプリング周波数ミスマッチはユーティリティで吸収。初期実装では `pcm16` + 24000Hz を受け、`soxr` ベースの簡易リサンプルで 16000Hz へ変換。
+- 音声とテキストの同期: テキスト出力→音声再生の順序を保持。音声再生中も次応答処理は継続。
+
+## 7. 将来拡張余地
+- Responses API の `modalities: ['audio','text']` へ切替し、ツール呼び出しと音声を単一レスポンスで管理。citeturn5search7turn4search2
+- `gpt-realtime` を利用した完全音声対話（音声入力／音声出力）へ拡張し、ツール呼び出しは `function_call` イベントで処理。
+- TTS キャッシュ: 同一文の再生はローカルファイルに保存し、API 呼び出し数を削減。
+- ボイス切替 UI: CLI ホットキーで音声を即時変更。
