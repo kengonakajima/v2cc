@@ -27,9 +27,15 @@ export class PlaybackQueue {
     while (this.queue.length && !this.stopped) {
       const item = this.queue.shift();
       try {
-        const segments = await this.ttsClient.synthesize(item.text);
-        for (const segment of segments) {
-          this.audioPlayer.enqueue(segment.samples, segment.sampleRate);
+        const segments = await this.ttsClient.synthesize(item.text, {
+          onSegment: (segment) => {
+            this.audioPlayer.enqueue(segment.samples, segment.sampleRate);
+          },
+        });
+        if (Array.isArray(segments) && segments.length) {
+          for (const segment of segments) {
+            this.audioPlayer.enqueue(segment.samples, segment.sampleRate);
+          }
         }
       } catch (error) {
         console.error(`[playback] TTS エラー: ${error.message}`);

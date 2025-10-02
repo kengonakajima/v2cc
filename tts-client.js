@@ -1,39 +1,115 @@
-const MAX_SEGMENT_CHARS = 600;
+const MAX_SEGMENT_CHARS = Math.max(10, Number.parseInt(process.env.VOICE_AGENT_TTS_SEGMENT_MAX ?? '70', 10));
+const TARGET_SEGMENT_CHARS = Math.max(
+  5,
+  Math.min(MAX_SEGMENT_CHARS, Number.parseInt(process.env.VOICE_AGENT_TTS_SEGMENT_TARGET ?? '30', 10))
+);
 const PCM_SAMPLE_RATE = 24000;
+const CANDIDATE_DELIMITERS = ['。', '．', '.', '！', '!', '？', '?', '、', ',', '，', ';', '；', ':', '：', '※'];
+const OPEN_BRACKETS = ['「', '『', '（', '(', '[', '{', '〈', '《', '“', '"'];
+const CLOSE_BRACKETS = ['」', '』', '）', ')', ']', '}', '〉', '》', '”', '"'];
+const WHITESPACE_REGEX = /\s+/g;
+const TOKEN_DELIMITERS = new Set([...CANDIDATE_DELIMITERS, ...OPEN_BRACKETS, ...CLOSE_BRACKETS, ' ']);
+const LEADING_BREAK_DELIMITERS = new Set(['※', ...OPEN_BRACKETS]);
+const TRAILING_BREAK_DELIMITERS = new Set(['。', '．', '.', '！', '!', '？', '?', ...CLOSE_BRACKETS]);
 
 function splitIntoSegments(text) {
-  const segments = [];
-  let buffer = '';
-  const sentences = text
-    .replace(/\s+/g, ' ')
-    .split(/(?<=[。．.!?！？])/u);
+  if (!text) return [];
+  const normalized = text.replace(WHITESPACE_REGEX, ' ').trim();
+  if (!normalized) return [];
 
-  for (const sentence of sentences) {
-    const trimmed = sentence.trim();
-    if (!trimmed) continue;
-    if (buffer.length + trimmed.length <= MAX_SEGMENT_CHARS) {
-      buffer += (buffer ? ' ' : '') + trimmed;
-    } else {
-      if (buffer) {
-        segments.push(buffer);
-        buffer = '';
+  const tokens = tokenize(normalized);
+  const segments = [];
+  let current = '';
+
+  for (const token of tokens) {
+    if (!token) continue;
+    const trimmedToken = token.trim();
+
+    if (shouldBreakBefore(trimmedToken) && current.trim()) {
+      segments.push(current.trim());
+      current = '';
+    }
+
+    if (token.length > MAX_SEGMENT_CHARS) {
+      if (current.trim()) {
+        segments.push(current.trim());
+        current = '';
       }
-      if (trimmed.length <= MAX_SEGMENT_CHARS) {
-        buffer = trimmed;
-      } else {
-        let start = 0;
-        while (start < trimmed.length) {
-          segments.push(trimmed.slice(start, start + MAX_SEGMENT_CHARS));
-          start += MAX_SEGMENT_CHARS;
-        }
+      segments.push(...fallbackChunk(token));
+      continue;
+    }
+
+    const merged = `${current}${token}`;
+    if (merged.trim().length > MAX_SEGMENT_CHARS) {
+      if (current.trim()) {
+        segments.push(current.trim());
       }
+      current = token;
+      continue;
+    }
+
+    current = merged;
+    if (
+      current.trim().length >= TARGET_SEGMENT_CHARS ||
+      shouldBreakAfter(trimmedToken)
+    ) {
+      segments.push(current.trim());
+      current = '';
     }
   }
-  if (buffer) segments.push(buffer);
-  if (!segments.length && text.trim()) {
-    segments.push(text.trim());
+
+  if (current.trim()) {
+    segments.push(current.trim());
   }
-  return segments;
+
+  return segments.flatMap((segment) =>
+    segment.length > MAX_SEGMENT_CHARS ? fallbackChunk(segment) : [segment]
+  );
+}
+
+function tokenize(text) {
+  const tokens = [];
+  let buffer = '';
+  for (const char of text) {
+    buffer += char;
+    if (TOKEN_DELIMITERS.has(char)) {
+      tokens.push(buffer);
+      buffer = '';
+    }
+  }
+  if (buffer) {
+    tokens.push(buffer);
+  }
+  return tokens;
+}
+
+function shouldBreakBefore(token) {
+  if (!token) return false;
+  if (token.length > 1) return false;
+  return LEADING_BREAK_DELIMITERS.has(token);
+}
+
+function shouldBreakAfter(token) {
+  if (!token) return false;
+  const last = token[token.length - 1];
+  return TRAILING_BREAK_DELIMITERS.has(last);
+}
+
+function fallbackChunk(text) {
+  const chunks = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const end = Math.min(cursor + MAX_SEGMENT_CHARS, text.length);
+    const chunk = text.slice(cursor, end).trim();
+    if (chunk) {
+      chunks.push(chunk);
+    }
+    cursor = end;
+  }
+  if (!chunks.length) {
+    chunks.push(text.trim());
+  }
+  return chunks;
 }
 
 export class TtsClient {
@@ -44,12 +120,14 @@ export class TtsClient {
     this.instructions = instructions;
   }
 
-  async synthesize(text) {
+  async synthesize(text, { onSegment } = {}) {
     const trimmed = (text ?? '').trim();
     if (!trimmed) return [];
     const segments = splitIntoSegments(trimmed);
+    const immediate = typeof onSegment === 'function';
     const outputs = [];
     for (const segment of segments) {
+      console.log(`[tts] segment (${segment.length} chars): ${segment}`);
       try {
         const response = await this.client.audio.speech.create({
           model: this.model,
@@ -60,7 +138,13 @@ export class TtsClient {
         });
         const arrayBuffer = await response.arrayBuffer();
         const samples = new Int16Array(arrayBuffer);
-        outputs.push({ samples, sampleRate: PCM_SAMPLE_RATE });
+        const payload = { samples, sampleRate: PCM_SAMPLE_RATE };
+        if (immediate) {
+          onSegment(payload);
+        } else {
+          outputs.push(payload);
+        }
+        console.log(`[tts] received (${segment.length} chars)`);
       } catch (error) {
         throw new Error(`TTS 合成に失敗しました: ${error.message}`);
       }
