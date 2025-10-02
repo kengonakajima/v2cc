@@ -19,11 +19,14 @@ if (!OPENAI_API_KEY) {
 const args = new Set(process.argv.slice(2));
 const DEBUG_MIC = args.has('--debug-mic');
 
+const LLM_PROVIDER = (process.env.VOICE_AGENT_LLM_PROVIDER ?? 'openai').toLowerCase();
 const MODEL_ID = process.env.OPENAI_MODEL ?? 'gpt-5-mini';
+const GROQ_MODEL_ID = process.env.GROQ_MODEL ?? 'gpt-oss-120b';
 const MAX_TOOL_ITERATIONS = Number.parseInt(process.env.VOICE_AGENT_TOOL_LOOP_MAX ?? '3', 10);
 const MAX_HISTORY_ITEMS = Number.parseInt(process.env.VOICE_AGENT_HISTORY_LIMIT ?? '20', 10);
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const toolDefinitions = getToolDefinitions();
 const hasTools = toolDefinitions.length > 0;
 
@@ -413,19 +416,33 @@ async function runTurn({ text, timestamp }) {
   let iteration = 0;
   let continueLoop = true;
   while (continueLoop && iteration < MAX_TOOL_ITERATIONS) {
-    const requestBody = {
-      model: MODEL_ID,
-      input: conversation,
-      parallel_tool_calls: false,
-    };
+    let textOutputs = [];
+    let toolCalls = [];
 
-    if (hasTools) {
-      requestBody.tools = toolDefinitions;
-      requestBody.tool_choice = 'auto';
+    if (LLM_PROVIDER === 'groq') {
+      if (!GROQ_API_KEY) {
+        throw new Error('GROQ_API_KEY が設定されていません (.env で指定してください)');
+      }
+      const response = await callGroqChat({
+        conversation,
+        tools: hasTools ? toolDefinitions : null,
+      });
+      ({ textOutputs, toolCalls } = dissectGroqResponse(response));
+    } else {
+      const requestBody = {
+        model: MODEL_ID,
+        input: conversation,
+        parallel_tool_calls: false,
+      };
+
+      if (hasTools) {
+        requestBody.tools = toolDefinitions;
+        requestBody.tool_choice = 'auto';
+      }
+
+      const response = await client.responses.create(requestBody);
+      ({ textOutputs, toolCalls } = dissectResponse(response));
     }
-
-    const response = await client.responses.create(requestBody);
-    const { textOutputs, toolCalls } = dissectResponse(response);
 
     textOutputs.forEach((output) => {
       console.log(`[assistant] ${output}`);
@@ -526,6 +543,170 @@ function dissectResponse(response) {
         arguments: item.arguments,
       });
     }
+  }
+
+  return { textOutputs, toolCalls };
+}
+
+async function callGroqChat({ conversation: items, tools }) {
+  const messages = convertConversationToGroqMessages(items);
+  const body = {
+    model: GROQ_MODEL_ID,
+    messages,
+  };
+
+  if (Array.isArray(tools) && tools.length) {
+    body.tools = normalizeToolsForChat(tools);
+    body.tool_choice = 'auto';
+  }
+
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '');
+    throw new Error(`Groq API リクエスト失敗: ${response.status} ${response.statusText} ${errorText}`.trim());
+  }
+
+  return response.json();
+}
+
+function normalizeToolsForChat(tools) {
+  return tools.map((tool) => {
+    if (!tool || tool.type !== 'function') {
+      return tool;
+    }
+    return {
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      },
+    };
+  });
+}
+
+function convertConversationToGroqMessages(items) {
+  const messages = [];
+  for (const item of items) {
+    if (!item) {
+      continue;
+    }
+    if (item.type === 'message') {
+      const role = item.role ?? 'user';
+      const text = extractTextFromContent(item.content);
+      messages.push({ role, content: text ?? '' });
+      continue;
+    }
+    if (item.type === 'function_call') {
+      const callId = item.call_id ?? `call_${Date.now()}`;
+      const args = typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {});
+      messages.push({
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            id: callId,
+            type: 'function',
+            function: {
+              name: item.name,
+              arguments: args,
+            },
+          },
+        ],
+      });
+      continue;
+    }
+    if (item.type === 'function_call_output') {
+      messages.push({
+        role: 'tool',
+        tool_call_id: item.call_id,
+        content: item.output ?? '',
+      });
+    }
+  }
+  return messages;
+}
+
+function extractTextFromContent(content) {
+  if (!Array.isArray(content)) {
+    return '';
+  }
+  const parts = [];
+  for (const entry of content) {
+    if (entry && typeof entry.text === 'string') {
+      parts.push(entry.text);
+    }
+  }
+  return parts.join('');
+}
+
+function dissectGroqResponse(response) {
+  const textOutputs = [];
+  const toolCalls = [];
+  const choice = Array.isArray(response?.choices) ? response.choices[0] : null;
+  const message = choice?.message ?? {};
+
+  const content = message.content;
+  if (typeof content === 'string') {
+    if (content.trim()) {
+      textOutputs.push(content);
+    }
+  } else if (Array.isArray(content)) {
+    const textParts = content
+      .map((entry) => {
+        if (!entry) return '';
+        if (typeof entry === 'string') return entry;
+        if (typeof entry?.text === 'string') return entry.text;
+        return '';
+      })
+      .filter(Boolean);
+    if (textParts.length) {
+      textOutputs.push(textParts.join(''));
+    }
+  }
+
+  if (Array.isArray(message.tool_calls)) {
+    for (const call of message.tool_calls) {
+      if (!call) continue;
+      const fn = call.function ?? {};
+      let args = fn.arguments;
+      if (typeof args === 'object') {
+        args = JSON.stringify(args);
+      }
+      if (typeof args !== 'string') {
+        args = '{}';
+      }
+      toolCalls.push({
+        call_id: call.id ?? `call_${Date.now()}`,
+        name: fn.name ?? '',
+        arguments: args,
+      });
+    }
+  }
+
+  if (!message.tool_calls && message.function_call) {
+    const fn = message.function_call;
+    const callId = fn?.name ? `call_${Date.now()}` : `call_${Date.now()}`;
+    let args = fn?.arguments;
+    if (typeof args === 'object') {
+      args = JSON.stringify(args);
+    }
+    if (typeof args !== 'string') {
+      args = '{}';
+    }
+    toolCalls.push({
+      call_id: callId,
+      name: fn?.name ?? '',
+      arguments: args,
+    });
   }
 
   return { textOutputs, toolCalls };
