@@ -39,6 +39,14 @@ const browserClientPath = path.resolve(__dirname, 'browser-client.html');
 const HTTP_PORT = Number.parseInt(process.env.VOICE_AGENT_HTTP_PORT ?? '3000', 10);
 const BROWSER_WS_PORT = Number.parseInt(process.env.VOICE_AGENT_BROWSER_WS_PORT ?? '8080', 10);
 const MEETING_NOTES_PATH = path.resolve(__dirname, 'meeting-notes.log');
+const WORKSPACE_DIR = path.resolve(__dirname, 'workspace');
+const TODOS_FILE_PATH = path.resolve(WORKSPACE_DIR, 'todos.json');
+
+const todoState = {
+  loaded: false,
+  nextId: 1,
+  todos: [],
+};
 
 let browserClientHtml = '';
 try {
@@ -95,6 +103,9 @@ try {
       return;
     }
     browserClients.add(socket);
+    sendTodosSnapshotToSocket(socket).catch((error) => {
+      console.error(`[voice-agent] TODO 初期送信失敗: ${error.message}`);
+    });
     socket.on('message', (data) => {
       handleBrowserSocketMessage(socket, data);
     });
@@ -189,6 +200,10 @@ const baseSystemPrompt =
     '- When mathematical expressions are needed, describe them verbally without mathematical symbols so they are easy to speak aloud.';
 
 addToConversation(createMessage('system', baseSystemPrompt));
+
+ensureTodosLoaded().then(() => {
+  console.log(`[voice-agent] TODO 初期化完了 (${todoState.todos.length} 件)`);
+});
 
 startRealtime().catch((error) => {
   console.error(`[voice-agent] Realtime 初期化エラー: ${error.message}`);
@@ -463,6 +478,229 @@ function broadcastToBrowserClients(payload) {
   }
 }
 
+function getSafeTodoDescription(description) {
+  if (typeof description !== 'string') {
+    return '';
+  }
+  const trimmed = description.trim();
+  return trimmed || '';
+}
+
+function cloneTodoEntry(entry) {
+  return {
+    id: entry.id,
+    description: entry.description,
+    done: entry.done,
+  };
+}
+
+function loadTodosFromParsed(parsed) {
+  if (!Array.isArray(parsed)) {
+    todoState.todos = [];
+    todoState.nextId = 1;
+    return;
+  }
+
+  const normalized = [];
+  let maxId = 0;
+
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+    const rawId = Number.parseInt(entry.id, 10);
+    if (!Number.isFinite(rawId) || rawId <= 0) {
+      continue;
+    }
+    const description = getSafeTodoDescription(entry.description);
+    const done = Boolean(entry.done);
+    normalized.push({ id: rawId, description, done });
+    if (rawId > maxId) {
+      maxId = rawId;
+    }
+  }
+
+  normalized.sort((a, b) => a.id - b.id);
+  todoState.todos = normalized;
+  todoState.nextId = maxId + 1;
+  if (todoState.nextId <= 1) {
+    todoState.nextId = 1;
+  }
+}
+
+function serializeTodos() {
+  const payload = todoState.todos.map((entry) => ({
+    id: entry.id,
+    description: entry.description,
+    done: entry.done,
+  }));
+  return `${JSON.stringify(payload, null, 2)}\n`;
+}
+
+async function persistTodos() {
+  const json = serializeTodos();
+  return fs.promises.writeFile(TODOS_FILE_PATH, json, 'utf8').catch((error) => {
+    console.error(`[voice-agent] TODO 書き込み失敗: ${error.message}`);
+  });
+}
+
+function findTodoIndexById(id) {
+  if (!Number.isFinite(id)) {
+    return -1;
+  }
+  return todoState.todos.findIndex((entry) => entry.id === id);
+}
+
+async function ensureTodosLoaded() {
+  if (todoState.loaded) {
+    return;
+  }
+  await fs.promises.mkdir(WORKSPACE_DIR, { recursive: true }).catch((error) => {
+    console.error(`[voice-agent] TODO ディレクトリ作成失敗: ${error.message}`);
+  });
+
+  await fs.promises
+    .readFile(TODOS_FILE_PATH, 'utf8')
+    .then((content) => {
+      const parsed = JSON.parse(content);
+      loadTodosFromParsed(parsed);
+    })
+    .catch((error) => {
+      if (error && error.code === 'ENOENT') {
+        todoState.todos = [];
+        todoState.nextId = 1;
+        return persistTodos();
+      }
+      console.error(`[voice-agent] TODO 読み込み失敗: ${error.message}`);
+      todoState.todos = [];
+      todoState.nextId = 1;
+      return persistTodos();
+    });
+
+  todoState.loaded = true;
+}
+
+async function getTodos() {
+  await ensureTodosLoaded();
+  return todoState.todos.map(cloneTodoEntry);
+}
+
+async function addTodo(description) {
+  await ensureTodosLoaded();
+  const safeDescription = getSafeTodoDescription(description);
+  if (!safeDescription) {
+    return null;
+  }
+  const todo = {
+    id: todoState.nextId,
+    description: safeDescription,
+    done: false,
+  };
+  todoState.nextId += 1;
+  todoState.todos.push(todo);
+  await persistTodos();
+  return cloneTodoEntry(todo);
+}
+
+async function updateTodoDescription(id, description) {
+  await ensureTodosLoaded();
+  const numericId = Number.parseInt(id, 10);
+  const index = findTodoIndexById(numericId);
+  if (index < 0) {
+    return null;
+  }
+  const safeDescription = getSafeTodoDescription(description);
+  if (!safeDescription) {
+    return null;
+  }
+  const target = todoState.todos[index];
+  target.description = safeDescription;
+  await persistTodos();
+  return cloneTodoEntry(target);
+}
+
+async function removeTodo(id) {
+  await ensureTodosLoaded();
+  const numericId = Number.parseInt(id, 10);
+  const index = findTodoIndexById(numericId);
+  if (index < 0) {
+    return false;
+  }
+  todoState.todos.splice(index, 1);
+  await persistTodos();
+  return true;
+}
+
+async function setTodoDone(id, done) {
+  await ensureTodosLoaded();
+  const numericId = Number.parseInt(id, 10);
+  const index = findTodoIndexById(numericId);
+  if (index < 0) {
+    return null;
+  }
+  const target = todoState.todos[index];
+  target.done = Boolean(done);
+  await persistTodos();
+  return cloneTodoEntry(target);
+}
+
+async function getTodoSnapshot() {
+  await ensureTodosLoaded();
+  return todoState.todos.map(cloneTodoEntry);
+}
+
+async function broadcastTodosSnapshot() {
+  const todos = await getTodoSnapshot();
+  broadcastToBrowserClients({ type: 'todos_sync', todos });
+}
+
+async function sendTodosSnapshotToSocket(socket) {
+  if (!socket) {
+    return;
+  }
+  await ensureTodosLoaded();
+  if (socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  const payload = { type: 'todos_sync', todos: todoState.todos.map(cloneTodoEntry) };
+  const message = JSON.stringify(payload);
+  socket.send(message);
+}
+
+const todoApi = {
+  async list() {
+    return getTodoSnapshot();
+  },
+  async add(description) {
+    const todo = await addTodo(description);
+    if (todo) {
+      await broadcastTodosSnapshot();
+    }
+    return todo;
+  },
+  async remove(id) {
+    const removed = await removeTodo(id);
+    if (removed) {
+      await broadcastTodosSnapshot();
+    }
+    return removed;
+  },
+  async update(id, description) {
+    const todo = await updateTodoDescription(id, description);
+    if (todo) {
+      await broadcastTodosSnapshot();
+    }
+    return todo;
+  },
+  async setDone(id, done) {
+    const todo = await setTodoDone(id, done);
+    if (todo) {
+      await broadcastTodosSnapshot();
+    }
+    return todo;
+  },
+};
+
 function createBrowserAudioOutput() {
   return {
     enqueue(samples, sampleRate) {
@@ -589,6 +827,7 @@ async function runTurn({ text, timestamp }) {
       userText: trimmed,
       timestamp,
       conversationSize: conversation.length,
+      todoApi,
     };
 
     for (const call of toolCalls) {

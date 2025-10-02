@@ -88,6 +88,25 @@
       font-size: 0.88rem;
       white-space: pre-wrap;
     }
+    .todos {
+      margin-top: 16px;
+      padding: 12px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      background: #fafafa;
+    }
+    .todos h2 {
+      font-size: 1.1rem;
+      margin: 0 0 8px;
+    }
+    #todoList {
+      margin: 0;
+      padding-left: 20px;
+    }
+    #todoList li {
+      margin-bottom: 4px;
+      word-break: break-word;
+    }
   </style>
 </head>
 <body>
@@ -137,6 +156,11 @@
       </div>
     </div>
 
+    <div class="todos">
+      <h2>TODO リスト</h2>
+      <ul id="todoList"></ul>
+    </div>
+
     <div id="log"></div>
   </div>
 
@@ -155,6 +179,7 @@
     const serverLevelBar = document.getElementById('serverLevelBar');
     const clientLevelValue = document.getElementById('clientLevelValue');
     const serverLevelValue = document.getElementById('serverLevelValue');
+    const todoListElement = document.getElementById('todoList');
 
     const TARGET_SAMPLE_RATE = 24000;
     const CHUNK_SIZE = 4096;
@@ -385,6 +410,22 @@
       stopAllPlayback();
     }
 
+    function renderTodos(todos) {
+      todoListElement.innerHTML = '';
+      if (!Array.isArray(todos) || todos.length === 0) {
+        const emptyItem = document.createElement('li');
+        emptyItem.textContent = 'TODO はありません';
+        todoListElement.appendChild(emptyItem);
+        return;
+      }
+      todos.forEach((todo) => {
+        const item = document.createElement('li');
+        const status = todo.done ? '✅' : '⬜️';
+        item.textContent = `${status} [${todo.id}] ${todo.description}`;
+        todoListElement.appendChild(item);
+      });
+    }
+
     function handleServerMessage(raw) {
       let payload;
       try {
@@ -414,6 +455,9 @@
           if (payload.text) {
             appendLog(`AI: ${payload.text}`);
           }
+          break;
+        case 'todos_sync':
+          renderTodos(payload.todos);
           break;
         case 'tts':
           enqueueTtsPlayback(payload);
@@ -609,6 +653,7 @@
     updateClientLevel(0);
     updateServerLevel(0);
     interruptButton.textContent = '応答停止';
+    renderTodos([]);
   </script>
 </body>
 </html>

@@ -39,6 +39,94 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
+  {
+    type: 'function',
+    name: 'addTodo',
+    description: 'Add a new TODO item with the provided description.',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        description: {
+          type: 'string',
+          description: '内容を表す説明文。',
+        },
+      },
+      required: ['description'],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'delTodo',
+    description: 'Delete a TODO item by id.',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'integer',
+          description: '削除対象の TODO ID。',
+        },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'updateTodo',
+    description: 'Update the description text of a TODO item.',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'integer',
+          description: '更新対象の TODO ID。',
+        },
+        description: {
+          type: 'string',
+          description: '新しい説明文。',
+        },
+      },
+      required: ['id', 'description'],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'setDone',
+    description: 'Update the done status of a TODO item.',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        id: {
+          type: 'integer',
+          description: '対象の TODO ID。',
+        },
+        done: {
+          type: 'boolean',
+          description: '完了状態。true で完了。',
+        },
+      },
+      required: ['id', 'done'],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'listTodo',
+    description: 'List all TODO items currently stored.',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  },
 ];
 
 const TOOL_HANDLERS = {
@@ -58,6 +146,71 @@ const TOOL_HANDLERS = {
       location: location ?? '現在地',
       issued_at: new Date().toISOString(),
     };
+  },
+  async addTodo(args = {}, context = {}) {
+    const api = resolveTodoApi(context);
+    if (!api) {
+      return { error: 'todo manager unavailable' };
+    }
+    const description = typeof args.description === 'string' ? args.description : '';
+    return api.add(description).then((todo) => {
+      if (!todo) {
+        return { error: 'failed to add todo' };
+      }
+      return { todo };
+    });
+  },
+  async delTodo(args = {}, context = {}) {
+    const api = resolveTodoApi(context);
+    if (!api) {
+      return { error: 'todo manager unavailable' };
+    }
+    const id = Number.parseInt(args.id, 10);
+    if (!Number.isFinite(id) || id <= 0) {
+      return { error: 'invalid id' };
+    }
+    return api.remove(id).then((removed) => ({ success: Boolean(removed) }));
+  },
+  async updateTodo(args = {}, context = {}) {
+    const api = resolveTodoApi(context);
+    if (!api) {
+      return { error: 'todo manager unavailable' };
+    }
+    const id = Number.parseInt(args.id, 10);
+    if (!Number.isFinite(id) || id <= 0) {
+      return { error: 'invalid id' };
+    }
+    const description = typeof args.description === 'string' ? args.description : '';
+    return api.update(id, description).then((todo) => {
+      if (!todo) {
+        return { error: 'update failed' };
+      }
+      return { todo };
+    });
+  },
+  async setDone(args = {}, context = {}) {
+    const api = resolveTodoApi(context);
+    if (!api) {
+      return { error: 'todo manager unavailable' };
+    }
+    const id = Number.parseInt(args.id, 10);
+    if (!Number.isFinite(id) || id <= 0) {
+      return { error: 'invalid id' };
+    }
+    const done = Boolean(args.done);
+    return api.setDone(id, done).then((todo) => {
+      if (!todo) {
+        return { error: 'setDone failed' };
+      }
+      return { todo };
+    });
+  },
+  async listTodo(_args = {}, context = {}) {
+    const api = resolveTodoApi(context);
+    if (!api) {
+      return { error: 'todo manager unavailable' };
+    }
+    return api.list().then((todos) => ({ todos }));
   },
 };
 
@@ -83,6 +236,21 @@ export async function routeToolCall(call, context = {}) {
     call_id: call.call_id,
     output: JSON.stringify(result ?? {}),
   };
+}
+
+function resolveTodoApi(context) {
+  if (!context || typeof context !== 'object') {
+    return null;
+  }
+  const api = context.todoApi;
+  if (!api || typeof api !== 'object') {
+    return null;
+  }
+  const hasMethods = typeof api.list === 'function' && typeof api.add === 'function' && typeof api.remove === 'function' && typeof api.update === 'function' && typeof api.setDone === 'function';
+  if (!hasMethods) {
+    return null;
+  }
+  return api;
 }
 
 function deriveCorrelation(toolCorrelationId, context) {
