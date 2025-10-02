@@ -1,19 +1,14 @@
 #!/usr/bin/env node
 
 import 'dotenv/config';
-import { spawn } from 'child_process';
-import { fileURLToPath } from 'url';
-import { createInterface } from 'readline';
-import path from 'path';
 import process from 'process';
 import OpenAI from 'openai';
 import { getToolDefinitions, routeToolCall } from './tool-router.js';
 import { AudioPlayer } from './audio-player.js';
 import { TtsClient } from './tts-client.js';
 import { PlaybackQueue } from './playback-queue.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import WebSocket from 'ws';
+import { createRequire } from 'module';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 if (!OPENAI_API_KEY) {
@@ -22,14 +17,11 @@ if (!OPENAI_API_KEY) {
 }
 
 const args = new Set(process.argv.slice(2));
+const DEBUG_MIC = args.has('--debug-mic');
 
 const MODEL_ID = process.env.OPENAI_MODEL ?? 'gpt-5-mini';
-const TRANSCRIBE_PATH = path.join(__dirname, 'transcribe.js');
 const MAX_TOOL_ITERATIONS = Number.parseInt(process.env.VOICE_AGENT_TOOL_LOOP_MAX ?? '3', 10);
 const MAX_HISTORY_ITEMS = Number.parseInt(process.env.VOICE_AGENT_HISTORY_LIMIT ?? '20', 10);
-const TRANSCRIBE_STATUS_PATTERNS = [
-  /Realtime API/, /マイク入力を開始します/, /WebSocket エラー/, /API エラー/, /Fatal error/,
-];
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 const toolDefinitions = getToolDefinitions();
@@ -41,20 +33,62 @@ const ttsModel = process.env.VOICE_AGENT_TTS_MODEL ?? 'gpt-4o-mini-tts';
 const ttsVoice = process.env.VOICE_AGENT_TTS_VOICE ?? 'alloy';
 
 let playbackQueue = null;
+let audioPlayerInstance = null;
 if (!ttsDisabledFlag && !ttsEnvDisabled) {
   try {
-    const audioPlayer = new AudioPlayer();
+    audioPlayerInstance = new AudioPlayer({
+      onStateChange: (state) => {
+        if (!micController) return;
+        if (state === 'start') {
+          micController.pause?.();
+        } else if (state === 'stop') {
+          micController.resume?.();
+        }
+      },
+    });
     const ttsClient = new TtsClient(client, { model: ttsModel, voice: ttsVoice });
-    playbackQueue = new PlaybackQueue({ audioPlayer, ttsClient, enabled: true });
+    playbackQueue = new PlaybackQueue({ audioPlayer: audioPlayerInstance, ttsClient, enabled: true });
   } catch (error) {
     console.error(`[voice-agent] TTS 初期化に失敗しました: ${error.message}`);
   }
 }
 
+const MIC_SAMPLE_RATE = 24000;
+const MIC_BLOCK_SIZE = 960;
+const MIC_TICK_MS = Math.max(Math.round((MIC_BLOCK_SIZE / MIC_SAMPLE_RATE) * 1000), 10);
+
+const TRAILING_PUNCTUATION_REGEX = /[。．\.?!！？、，]$/u;
+const LATIN_ENDING_REGEX = /[A-Za-z0-9]$/;
+const POLITE_BASE_ENDINGS = [
+  'です',
+  'でした',
+  'でしょう',
+  'でしょ',
+  'ます',
+  'ました',
+  'ません',
+  'ませんでした',
+];
+const POLITE_SUFFIXES = ['ね', 'よ', 'よね'];
+const POLITE_QUESTION_SUFFIXES = ['か', 'かね', 'かしら'];
+const JAPANESE_POLITE_ENDINGS = new Set([
+  ...POLITE_BASE_ENDINGS,
+  ...POLITE_BASE_ENDINGS.flatMap((base) => [
+    ...POLITE_SUFFIXES.map((suffix) => `${base}${suffix}`),
+    ...POLITE_QUESTION_SUFFIXES.map((suffix) => `${base}${suffix}`),
+  ]),
+]);
+
+const PARTIAL_STAGE_HINTS = new Set(['partial', 'delta', 'updated', 'created', 'in_progress']);
+const FINAL_STAGE_HINTS = new Set(['completed', 'complete', 'final', 'finished', 'done']);
+
 const conversation = [];
 const pendingUtterances = [];
 let processingQueue = false;
 let shuttingDown = false;
+let realtimeSocket = null;
+let micController = null;
+let lastPartialTranscript = '';
 
 const baseSystemPrompt =
   process.env.VOICE_AGENT_SYSTEM_PROMPT ??
@@ -64,7 +98,10 @@ const baseSystemPrompt =
 
 addToConversation(createMessage('system', baseSystemPrompt));
 
-startTranscriber();
+startRealtime().catch((error) => {
+  console.error(`[voice-agent] Realtime 初期化エラー: ${error.message}`);
+  initiateShutdown(1, null);
+});
 setupSignalHandlers();
 
 function initiateShutdown(code, reason) {
@@ -74,6 +111,22 @@ function initiateShutdown(code, reason) {
     console.error(reason);
   }
   const finalize = async () => {
+    try {
+      if (micController) {
+        await Promise.resolve(micController.shutdown?.());
+        micController = null;
+      }
+    } catch (error) {
+      console.error(`[voice-agent] マイク停止エラー: ${error.message}`);
+    }
+    try {
+      if (realtimeSocket && realtimeSocket.readyState === WebSocket.OPEN) {
+        realtimeSocket.close();
+      }
+      realtimeSocket = null;
+    } catch (error) {
+      console.error(`[voice-agent] Realtime 接続終了エラー: ${error.message}`);
+    }
     try {
       if (playbackQueue) {
         await playbackQueue.shutdown();
@@ -87,29 +140,6 @@ function initiateShutdown(code, reason) {
   finalize();
 }
 
-function startTranscriber() {
-  console.error('[voice-agent] transcribe.js を起動します');
-  const child = spawn(process.execPath, [TRANSCRIBE_PATH], {
-    stdio: ['inherit', 'pipe', 'inherit'],
-  });
-
-  const rl = createInterface({ input: child.stdout });
-  rl.on('line', handleTranscribeLine);
-
-  child.on('exit', (code, signal) => {
-    if (shuttingDown) {
-      return;
-    }
-    const suffix = signal ? `signal=${signal}` : `code=${code}`;
-    initiateShutdown(typeof code === 'number' ? code : 1, `[voice-agent] transcribe.js が終了しました (${suffix})`);
-  });
-
-  process.on('exit', () => {
-    shuttingDown = true;
-    child.kill('SIGTERM');
-  });
-}
-
 function setupSignalHandlers() {
   const exitHandler = (signal) => {
     initiateShutdown(0, `\n[voice-agent] ${signal} を受信しました。終了します`);
@@ -119,24 +149,235 @@ function setupSignalHandlers() {
   process.on('SIGTERM', () => exitHandler('SIGTERM'));
 }
 
-function handleTranscribeLine(rawLine) {
-  const line = rawLine.trim();
-  if (!line) return;
-
-  if (line.startsWith('[partial]')) {
-    const text = line.slice('[partial]'.length).trim();
-    process.stdout.write(`\r[speech:partial] ${text}`);
+async function startRealtime() {
+  console.error('[voice-agent] Realtime API に接続しています...');
+  try {
+    realtimeSocket = await connectToRealtimeAPI();
+  } catch (error) {
+    console.error(`[voice-agent] Realtime API 接続失敗: ${error.message}`);
+    initiateShutdown(1, null);
     return;
   }
 
-  if (TRANSCRIBE_STATUS_PATTERNS.some((pattern) => pattern.test(line))) {
-    console.error(`[transcribe] ${line}`);
-    return;
+  realtimeSocket.on('close', () => {
+    if (!shuttingDown) {
+      initiateShutdown(0, '[voice-agent] Realtime API との接続が切断されました');
+    }
+  });
+
+  realtimeSocket.on('error', (error) => {
+    console.error(`[voice-agent] WebSocket エラー: ${error.message}`);
+  });
+
+  realtimeSocket.on('message', async (data) => {
+    try {
+      await handleRealtimeMessage(data);
+    } catch (error) {
+      console.error(`[voice-agent] メッセージ処理エラー: ${error.message}`);
+    }
+  });
+
+  sendSessionConfiguration();
+
+  micController = createMicController({
+    onChunk: (buffer) => {
+      if (!buffer || buffer.length === 0) return;
+      if (realtimeSocket?.readyState !== WebSocket.OPEN) return;
+      const base64 = buffer.toString('base64');
+      if (DEBUG_MIC) {
+        console.log(`[mic] append bytes=${buffer.length} base64=${base64.length}`);
+      }
+      realtimeSocket.send(
+        JSON.stringify({
+          type: 'input_audio_buffer.append',
+          audio: base64,
+        })
+      );
+    },
+    onPause: () => {
+      // drop buffered audio on pause to avoid leaking playback audio
+    },
+    onShutdown: () => {
+      // nothing to flush; rely on server VAD
+    },
+  });
+
+  try {
+    micController.start();
+  } catch (error) {
+    console.error(`[voice-agent] マイク開始失敗: ${error.message}`);
+    initiateShutdown(1, null);
+  }
+}
+
+function createMicController({ onChunk, onPause, onShutdown }) {
+  const require = createRequire(import.meta.url);
+  const PortAudio = require('./PAmac.node');
+  let timer = null;
+  let paused = false;
+  let started = false;
+  let stopped = false;
+
+  function toPcmBuffer(raw) {
+    if (!raw) return null;
+    if (Buffer.isBuffer(raw)) {
+      return raw.length ? raw : null;
+    }
+    if (ArrayBuffer.isView(raw)) {
+      if (raw.byteLength === 0) return null;
+      return Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
+    }
+   if (Array.isArray(raw)) {
+      if (!raw.length) return null;
+      const buf = Buffer.alloc(raw.length * 2);
+      for (let i = 0; i < raw.length; i++) {
+        buf.writeInt16LE(raw[i] | 0, i * 2);
+      }
+      if (DEBUG_MIC) {
+        console.log(`[mic] converted array samples=${raw.length}`);
+      }
+      return buf;
+    }
+    if (typeof raw === 'object' && typeof raw.length === 'number') {
+      if (!raw.length) return null;
+      const buf = Buffer.alloc(raw.length * 2);
+      for (let i = 0; i < raw.length; i++) {
+        buf.writeInt16LE(raw[i] | 0, i * 2);
+      }
+      if (DEBUG_MIC) {
+        console.log(`[mic] converted typed object samples=${raw.length}`);
+      }
+      return buf;
+    }
+    return null;
   }
 
-  process.stdout.write('\r');
-  console.log(`[speech:final] ${line}`);
-  enqueueUtterance({ text: line, timestamp: Date.now() });
+  const tick = () => {
+    if (stopped) return;
+    const raw = PortAudio.getRecordedSamples();
+    const buffer = toPcmBuffer(raw);
+    if (!buffer || buffer.length === 0) {
+      if (DEBUG_MIC) {
+        console.log('[mic] no samples');
+      }
+      return;
+    }
+    const sampleCount = buffer.length / 2;
+    if (!paused) {
+      onChunk(buffer);
+    } else if (DEBUG_MIC) {
+      console.log(`[mic] paused, dropping ${buffer.length} bytes`);
+    }
+    if (sampleCount > 0 && typeof PortAudio.discardRecordedSamples === 'function') {
+      try {
+        PortAudio.discardRecordedSamples(sampleCount);
+      } catch (_) {}
+    }
+  };
+
+  return {
+    start() {
+      if (started) return;
+      PortAudio.initSampleBuffers(MIC_SAMPLE_RATE, MIC_SAMPLE_RATE, MIC_BLOCK_SIZE);
+      PortAudio.startMic();
+      paused = false;
+      stopped = false;
+      timer = setInterval(tick, MIC_TICK_MS);
+      started = true;
+    },
+    pause() {
+      paused = true;
+      onPause?.();
+      if (DEBUG_MIC) {
+        console.log('[mic] paused');
+      }
+    },
+    resume() {
+      if (!stopped) {
+        paused = false;
+        if (DEBUG_MIC) {
+          console.log('[mic] resumed');
+        }
+      }
+    },
+    shutdown() {
+      if (stopped) return;
+      stopped = true;
+      paused = true;
+      onShutdown?.();
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      try {
+        PortAudio.stopMic();
+      } catch (_) {}
+      if (DEBUG_MIC) {
+        console.log('[mic] shutdown');
+      }
+    },
+  };
+}
+
+async function connectToRealtimeAPI() {
+  const url = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview';
+  const socket = new WebSocket(url, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'OpenAI-Beta': 'realtime=v1',
+    },
+  });
+
+  return new Promise((resolve, reject) => {
+    socket.once('open', () => resolve(socket));
+    socket.once('error', reject);
+    socket.once('unexpected-response', (_req, res) => {
+      reject(new Error(`Unexpected response: ${res.statusCode} ${res.statusMessage}`));
+    });
+  });
+}
+
+function sendSessionConfiguration() {
+  if (realtimeSocket?.readyState !== WebSocket.OPEN) return;
+  realtimeSocket.send(
+    JSON.stringify({
+      type: 'session.update',
+      session: {
+        modalities: ['audio', 'text'],
+        instructions:
+          'You are a Japanese transcription assistant. Transcribe exactly what the user says in Japanese. Never output Korean characters. Always use Japanese (hiragana, katakana, or kanji) for transcription.',
+        voice: 'alloy',
+        input_audio_format: 'pcm16',
+        output_audio_format: 'pcm16',
+        input_audio_transcription: {
+          model: 'whisper-1',
+        },
+        turn_detection: {
+          type: 'server_vad',
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 200,
+        },
+        temperature: 0.8,
+      },
+    })
+  );
+}
+
+async function handleRealtimeMessage(data) {
+  let message;
+  try {
+    message = JSON.parse(data.toString());
+  } catch (error) {
+    console.error(`[voice-agent] メッセージ解析エラー: ${error.message}`);
+    return;
+  }
+  if (await handleTranscriptionEnvelope(message)) {
+    return;
+  }
+  if (message.type === 'error') {
+    console.error(`[voice-agent] API エラー: ${message.error?.message ?? '詳細不明'}`);
+  }
 }
 
 function enqueueUtterance(utterance) {
@@ -288,4 +529,184 @@ function dissectResponse(response) {
   }
 
   return { textOutputs, toolCalls };
+}
+
+function hasJapanesePoliteEnding(text) {
+  for (const ending of JAPANESE_POLITE_ENDINGS) {
+    if (text.endsWith(ending)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function ensureTrailingPunctuation(text) {
+  if (!text) return text;
+  const trimmed = text.trim();
+  if (!trimmed) return trimmed;
+  if (TRAILING_PUNCTUATION_REGEX.test(trimmed.slice(-1))) {
+    return trimmed;
+  }
+  if (hasJapanesePoliteEnding(trimmed)) {
+    return `${trimmed}。`;
+  }
+  if (LATIN_ENDING_REGEX.test(trimmed.slice(-1))) {
+    return `${trimmed}.`;
+  }
+  return trimmed;
+}
+
+function logPartial(text) {
+  if (!text) return;
+  if (text === lastPartialTranscript) return;
+  lastPartialTranscript = text;
+  process.stdout.write(`\r[speech:partial] ${text}`);
+}
+
+async function handleFinalTranscript(raw) {
+  const normalized = ensureTrailingPunctuation((raw ?? '').trim());
+  if (!normalized) {
+    return;
+  }
+  lastPartialTranscript = '';
+  process.stdout.write('\r');
+  console.log(`[speech:final] ${normalized}`);
+  enqueueUtterance({ text: normalized, timestamp: Date.now() });
+}
+
+function extractTranscript(message) {
+  let best = '';
+  const seen = new Set();
+  const consider = (value) => {
+    if (typeof value !== 'string') return;
+    const text = value.trim();
+    if (!text) return;
+    if (seen.has(text)) return;
+    seen.add(text);
+    if (text.length >= best.length) {
+      best = text;
+    }
+  };
+
+  const visit = (node) => {
+    if (!node) return;
+    if (typeof node === 'string') {
+      consider(node);
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const entry of node) {
+        visit(entry);
+      }
+      return;
+    }
+    if (typeof node !== 'object') return;
+
+    consider(node.transcript);
+    consider(node.text);
+    consider(node.value);
+
+    if ('partial' in node) visit(node.partial);
+    if ('delta' in node) visit(node.delta);
+    if ('content' in node) visit(node.content);
+    if ('item' in node) visit(node.item);
+    if (Array.isArray(node.items)) {
+      for (const item of node.items) {
+        visit(item);
+      }
+    }
+  };
+
+  visit(message);
+  return best;
+}
+
+async function processTranscriptPayload(transcript, stageHint) {
+  const text = typeof transcript === 'string' ? transcript : '';
+  const stage = typeof stageHint === 'string' ? stageHint.toLowerCase() : '';
+  if (FINAL_STAGE_HINTS.has(stage)) {
+    await handleFinalTranscript(text);
+    return true;
+  }
+  if (text) {
+    logPartial(text);
+    return true;
+  }
+  if (PARTIAL_STAGE_HINTS.has(stage)) {
+    lastPartialTranscript = '';
+    return true;
+  }
+  return false;
+}
+
+async function handleTranscriptionEnvelope(message) {
+  if (!message?.type) return false;
+
+  if (message.type.startsWith('conversation.item.input_audio_transcription.')) {
+    const stage = message.type.split('.').pop();
+    const transcript = extractTranscript(message);
+    return processTranscriptPayload(transcript, stage);
+  }
+
+  if (message.type === 'conversation.item.created' || message.type === 'conversation.item.updated') {
+    const items = [];
+    if (message.item) items.push(message.item);
+    if (Array.isArray(message.items)) items.push(...message.items);
+    let handled = false;
+    for (const item of items) {
+      if (item?.type === 'input_audio_transcription') {
+        const stage = item.status || item.state || (message.type === 'conversation.item.updated' ? 'updated' : 'created');
+        const transcript = extractTranscript(item);
+        if (await processTranscriptPayload(transcript, stage)) {
+          handled = true;
+        }
+      }
+    }
+    if (handled) return true;
+  }
+
+  if (message.type === 'conversation.item.delta') {
+    const delta = message.delta;
+    if (delta?.type === 'input_audio_transcription') {
+      const stage = delta.status || delta.state || 'delta';
+      const transcript = extractTranscript(delta);
+      return processTranscriptPayload(transcript, stage);
+    }
+    if (Array.isArray(delta?.items)) {
+      let handled = false;
+      for (const item of delta.items) {
+        if (item?.type === 'input_audio_transcription') {
+          const stage = item.status || item.state || 'delta';
+          const transcript = extractTranscript(item);
+          if (await processTranscriptPayload(transcript, stage)) {
+            handled = true;
+          }
+        }
+      }
+      if (handled) return true;
+    }
+  }
+
+  if (message.type === 'response.output_text.delta' || message.type === 'response.delta') {
+    const transcript = extractTranscript(message);
+    if (transcript) {
+      logPartial(transcript);
+      return true;
+    }
+    if (Array.isArray(message.delta?.items)) {
+      let handled = false;
+      for (const item of message.delta.items) {
+        if (item?.type === 'input_audio_transcription') {
+          const stage = item.status || item.state || 'delta';
+          const transcript = extractTranscript(item);
+          if (await processTranscriptPayload(transcript, stage)) {
+            handled = true;
+          }
+        }
+      }
+      if (handled) return true;
+    }
+  }
+
+  return false;
 }

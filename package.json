@@ -10,11 +10,10 @@
     "start:tui": "node v2a.js"
   },
   "dependencies": {
-    "openai": "^4.81.0",
-    "node-record-lpcm16": "^1.0.1",
+    "blessed": "^0.1.81",
     "dotenv": "^16.0.3",
-    "ws": "^8.16.0",
-    "blessed": "^0.1.81"
+    "openai": "^4.81.0",
+    "ws": "^8.16.0"
   },
   "repository": {
     "type": "git",

@@ -55,9 +55,11 @@ AudioPlayer (新規)
    - `audio-player.js`: PortAudio(PAmac.node) のバッファを初期化し、PCM を `pushSamplesForPlay` へプッシュする。
    - flush ループで順番にブロックを供給し、重複再生を防ぐ。
 3. **voice-agent.js の拡張**
+   - Realtime API の WebSocket を直接管理し、PAmac マイク入力とテキスト処理を同一プロセスに統合。
    - 最終テキスト (`textOutputs`) をログ出力した直後に `playbackQueue.enqueue({ text, metadata })`。
+   - AudioPlayer の状態変化で `micController.pause/resume` を切り替え、TTS 出力がマイクに回り込まないよう制御。
    - エラーハンドリングは `try/catch` 内でログ＋フォールバック（音声なしで継続）。
-   - `SIGINT` 時に `playbackQueue.shutdown()` を呼び出し、PortAudio(PAmac) の再生プロセスを終了。
+   - `SIGINT` 時に `playbackQueue.shutdown()` と `micController.shutdown()` を呼び出し、PortAudio(PAmac) の再生/録音を停止。
 4. **設定項目**
 - `.env`: `VOICE_AGENT_TTS_MODEL=gpt-4o-mini-tts`, `VOICE_AGENT_TTS_VOICE=alloy`, `VOICE_AGENT_TTS_STREAM=true` 等。
    - CLI フラグ: `--no-tts` で従来挙動。

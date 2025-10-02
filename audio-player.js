@@ -5,7 +5,7 @@ const require = createRequire(import.meta.url);
 const PLAYBACK_SAMPLE_RATE = 24000;
 const BLOCK_SIZE = 960; // 40ms @ 24kHz
 const TICK_MS = Math.round((BLOCK_SIZE / PLAYBACK_SAMPLE_RATE) * 1000);
-const IDLE_TIMEOUT_MS = 1500;
+const IDLE_TIMEOUT_MS = 250;
 
 let PortAudio = null;
 let portAudioInitialized = false;
@@ -58,13 +58,14 @@ function resampleLinear(int16, fromRate, toRate) {
 }
 
 export class AudioPlayer {
-  constructor() {
+  constructor({ onStateChange } = {}) {
     this.buffers = [];
     this.bufferOffset = 0;
     this.timer = null;
     this.idleTimestamp = null;
     this.started = false;
     this.stopped = false;
+    this.onStateChange = typeof onStateChange === 'function' ? onStateChange : null;
   }
 
   ensureStarted() {
@@ -78,6 +79,7 @@ export class AudioPlayer {
     this.timer = setInterval(() => this.flush(), Math.max(TICK_MS, 10));
     this.started = true;
     this.stopped = false;
+    this.notifyState('start');
   }
 
   enqueue(samples, sampleRate = PLAYBACK_SAMPLE_RATE) {
@@ -146,6 +148,7 @@ export class AudioPlayer {
       clearInterval(this.timer);
       this.timer = null;
     }
+    this.notifyState('stop');
   }
 
   async shutdown() {
@@ -163,5 +166,14 @@ export class AudioPlayer {
       } catch (_) {}
     }
     this.started = false;
+    this.notifyState('stop');
+  }
+
+  notifyState(state) {
+    try {
+      this.onStateChange?.(state);
+    } catch (error) {
+      console.error(`[audio-player] 状態通知エラー: ${error.message}`);
+    }
   }
 }
