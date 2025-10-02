@@ -62,9 +62,11 @@ function splitIntoSegments(text) {
     segments.push(current.trim());
   }
 
-  return segments.flatMap((segment) =>
+  const normalizedSegments = segments.flatMap((segment) =>
     segment.length > MAX_SEGMENT_CHARS ? fallbackChunk(segment) : [segment]
   );
+
+  return mergeShortSegments(normalizedSegments);
 }
 
 function tokenize(text) {
@@ -110,6 +112,23 @@ function fallbackChunk(text) {
     chunks.push(text.trim());
   }
   return chunks;
+}
+
+function mergeShortSegments(segments) {
+  if (!Array.isArray(segments) || segments.length === 0) {
+    return [];
+  }
+  const merged = [];
+  for (const segment of segments) {
+    if (!segment) continue;
+    if (segment.length <= 10 && merged.length > 0) {
+      const previous = merged.pop();
+      merged.push(`${previous}${segment.startsWith(' ') ? '' : ''}${segment}`.trim());
+    } else {
+      merged.push(segment);
+    }
+  }
+  return merged;
 }
 
 export class TtsClient {
