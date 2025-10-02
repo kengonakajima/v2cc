@@ -41,12 +41,17 @@ const BROWSER_WS_PORT = Number.parseInt(process.env.VOICE_AGENT_BROWSER_WS_PORT 
 const MEETING_NOTES_PATH = path.resolve(__dirname, 'meeting-notes.log');
 const WORKSPACE_DIR = path.resolve(__dirname, 'workspace');
 const TODOS_FILE_PATH = path.resolve(WORKSPACE_DIR, 'todos.json');
+const MSG_SEND_SOUND_PATH = path.resolve(__dirname, 'msgsnd.mp3');
+const WORK_SOUND_PATH = path.resolve(__dirname, 'work.mp3');
 
 const todoState = {
   loaded: false,
   nextId: 1,
   todos: [],
 };
+
+let notificationSoundBase64 = null;
+let workSoundBase64 = null;
 
 let browserClientHtml = '';
 try {
@@ -203,6 +208,14 @@ addToConversation(createMessage('system', baseSystemPrompt));
 
 ensureTodosLoaded().then(() => {
   console.log(`[voice-agent] TODO 初期化完了 (${todoState.todos.length} 件)`);
+});
+
+loadNotificationSound().catch((error) => {
+  console.error(`[voice-agent] 通知音初期化失敗: ${error.message}`);
+});
+
+loadWorkSound().catch((error) => {
+  console.error(`[voice-agent] ツール通知音初期化失敗: ${error.message}`);
 });
 
 startRealtime().catch((error) => {
@@ -644,6 +657,62 @@ async function setTodoDone(id, done) {
   return cloneTodoEntry(target);
 }
 
+async function loadNotificationSound() {
+  try {
+    const data = await fs.promises.readFile(MSG_SEND_SOUND_PATH);
+    if (data && data.length) {
+      notificationSoundBase64 = data.toString('base64');
+      console.log('[voice-agent] 通知音を読み込みました');
+    }
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      console.error(`[voice-agent] 通知音ファイルが見つかりません: ${MSG_SEND_SOUND_PATH}`);
+    } else {
+      console.error(`[voice-agent] 通知音読み込み失敗: ${error.message}`);
+    }
+    notificationSoundBase64 = null;
+  }
+}
+
+function broadcastNotificationSound() {
+  if (!notificationSoundBase64) {
+    return;
+  }
+  broadcastToBrowserClients({
+    type: 'audio_notification',
+    format: 'mp3',
+    audio: notificationSoundBase64,
+  });
+}
+
+async function loadWorkSound() {
+  try {
+    const data = await fs.promises.readFile(WORK_SOUND_PATH);
+    if (data && data.length) {
+      workSoundBase64 = data.toString('base64');
+      console.log('[voice-agent] ツール通知音を読み込みました');
+    }
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      console.error(`[voice-agent] ツール通知音ファイルが見つかりません: ${WORK_SOUND_PATH}`);
+    } else {
+      console.error(`[voice-agent] ツール通知音読み込み失敗: ${error.message}`);
+    }
+    workSoundBase64 = null;
+  }
+}
+
+function broadcastWorkSound() {
+  if (!workSoundBase64) {
+    return;
+  }
+  broadcastToBrowserClients({
+    type: 'audio_notification',
+    format: 'mp3',
+    audio: workSoundBase64,
+  });
+}
+
 async function getTodoSnapshot() {
   await ensureTodosLoaded();
   return todoState.todos.map(cloneTodoEntry);
@@ -814,8 +883,9 @@ async function runTurn({ text, timestamp }) {
       }
       console.log(`[assistant] ${text}`);
       addToConversation(createMessage('assistant', text));
-      playbackQueue?.enqueue({ text });
       broadcastToBrowserClients({ type: 'assistant_text', text });
+      broadcastNotificationSound();
+      playbackQueue?.enqueue({ text });
     }
 
     if (!toolCalls.length) {
@@ -849,6 +919,7 @@ async function runTurn({ text, timestamp }) {
         output: toolOutput.output,
       });
       console.log(`[tool:${call.name}] ${toolOutput.output}`);
+      broadcastWorkSound();
     }
 
     iteration += 1;
