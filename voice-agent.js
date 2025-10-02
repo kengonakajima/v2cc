@@ -185,6 +185,7 @@ const baseSystemPrompt =
     '- When a custom tool is required, choose it and explain the action in Japanese.\n' +
     '- Speak in natural conversational Japanese. Avoid written list formatting, emojis, excessive symbols, or long strings of numbers. Keep responses brief.\n' +
     '- Prefer sentences no longer than about 30 Japanese characters; insert a line break before starting a new short sentence.\n' +
+    '- ユーザから明確な依頼・質問があった場合だけ内容を短く復唱してから回答を始めること。挨拶や雑談など依頼でない発言には復唱を入れない。\n' +
     '- When mathematical expressions are needed, describe them verbally without mathematical symbols so they are easy to speak aloud.';
 
 addToConversation(createMessage('system', baseSystemPrompt));
