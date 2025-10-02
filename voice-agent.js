@@ -7,7 +7,6 @@ import { getToolDefinitions, routeToolCall } from './tool-router.js';
 import { TtsClient } from './tts-client.js';
 import { PlaybackQueue } from './playback-queue.js';
 import WebSocket, { WebSocketServer } from 'ws';
-import { createRequire } from 'module';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
@@ -20,14 +19,12 @@ if (!OPENAI_API_KEY) {
 }
 
 const args = new Set(process.argv.slice(2));
-const DEBUG_MIC = args.has('--debug-mic');
 
 const LLM_PROVIDER = (process.env.VOICE_AGENT_LLM_PROVIDER ?? 'openai').toLowerCase();
 const MODEL_ID = process.env.OPENAI_MODEL ?? 'gpt-5-mini';
 const GROQ_MODEL_ID = process.env.GROQ_MODEL ?? 'gpt-oss-120b';
 const MAX_TOOL_ITERATIONS = Number.parseInt(process.env.VOICE_AGENT_TOOL_LOOP_MAX ?? '3', 10);
 const MAX_HISTORY_ITEMS = Number.parseInt(process.env.VOICE_AGENT_HISTORY_LIMIT ?? '20', 10);
-const enableLocalMic = (process.env.VOICE_AGENT_ENABLE_LOCAL_MIC ?? 'false').toLowerCase() !== 'false';
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
@@ -142,10 +139,6 @@ if (!ttsDisabledFlag && !ttsEnvDisabled) {
   }
 }
 
-const MIC_SAMPLE_RATE = 24000;
-const MIC_BLOCK_SIZE = 960;
-const MIC_TICK_MS = Math.max(Math.round((MIC_BLOCK_SIZE / MIC_SAMPLE_RATE) * 1000), 10);
-
 const TRAILING_PUNCTUATION_REGEX = /[。．\.?!！？、，]$/u;
 const LATIN_ENDING_REGEX = /[A-Za-z0-9]$/;
 const POLITE_BASE_ENDINGS = [
@@ -176,7 +169,6 @@ const pendingUtterances = [];
 let processingQueue = false;
 let shuttingDown = false;
 let realtimeSocket = null;
-let micController = null;
 let lastPartialTranscript = '';
 
 const baseSystemPrompt =
@@ -209,14 +201,6 @@ function initiateShutdown(code, reason) {
     console.error(reason);
   }
   const finalize = async () => {
-    try {
-      if (micController) {
-        await Promise.resolve(micController.shutdown?.());
-        micController = null;
-      }
-    } catch (error) {
-      console.error(`[voice-agent] マイク停止エラー: ${error.message}`);
-    }
     try {
       if (realtimeSocket && realtimeSocket.readyState === WebSocket.OPEN) {
         realtimeSocket.close();
@@ -294,148 +278,7 @@ async function startRealtime() {
 
   sendSessionConfiguration();
 
-  if (enableLocalMic) {
-    micController = createMicController({
-      onChunk: (buffer) => {
-        if (!buffer || buffer.length === 0) return;
-        if (realtimeSocket?.readyState !== WebSocket.OPEN) return;
-        const base64 = buffer.toString('base64');
-        if (DEBUG_MIC) {
-          console.log(`[mic] append bytes=${buffer.length} base64=${base64.length}`);
-        }
-        realtimeSocket.send(
-          JSON.stringify({
-            type: 'input_audio_buffer.append',
-            audio: base64,
-          })
-        );
-      },
-      onPause: () => {
-        // drop buffered audio on pause to avoid leaking playback audio
-      },
-      onShutdown: () => {
-        // nothing to flush; rely on server VAD
-      },
-    });
-
-    try {
-      micController.start();
-    } catch (error) {
-      console.error(`[voice-agent] マイク開始失敗: ${error.message}`);
-      initiateShutdown(1, null);
-    }
-  } else {
-    console.error('[voice-agent] ローカルマイク入力は無効化されています (VOICE_AGENT_ENABLE_LOCAL_MIC=false)');
-  }
-}
-
-function createMicController({ onChunk, onPause, onShutdown }) {
-  const require = createRequire(import.meta.url);
-  const PortAudio = require('./PAmac.node');
-  let timer = null;
-  let paused = false;
-  let started = false;
-  let stopped = false;
-
-  function toPcmBuffer(raw) {
-    if (!raw) return null;
-    if (Buffer.isBuffer(raw)) {
-      return raw.length ? raw : null;
-    }
-    if (ArrayBuffer.isView(raw)) {
-      if (raw.byteLength === 0) return null;
-      return Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
-    }
-   if (Array.isArray(raw)) {
-      if (!raw.length) return null;
-      const buf = Buffer.alloc(raw.length * 2);
-      for (let i = 0; i < raw.length; i++) {
-        buf.writeInt16LE(raw[i] | 0, i * 2);
-      }
-      if (DEBUG_MIC) {
-        console.log(`[mic] converted array samples=${raw.length}`);
-      }
-      return buf;
-    }
-    if (typeof raw === 'object' && typeof raw.length === 'number') {
-      if (!raw.length) return null;
-      const buf = Buffer.alloc(raw.length * 2);
-      for (let i = 0; i < raw.length; i++) {
-        buf.writeInt16LE(raw[i] | 0, i * 2);
-      }
-      if (DEBUG_MIC) {
-        console.log(`[mic] converted typed object samples=${raw.length}`);
-      }
-      return buf;
-    }
-    return null;
-  }
-
-  const tick = () => {
-    if (stopped) return;
-    const raw = PortAudio.getRecordedSamples();
-    const buffer = toPcmBuffer(raw);
-    if (!buffer || buffer.length === 0) {
-      if (DEBUG_MIC) {
-        console.log('[mic] no samples');
-      }
-      return;
-    }
-    const sampleCount = buffer.length / 2;
-    if (!paused) {
-      onChunk(buffer);
-    } else if (DEBUG_MIC) {
-      console.log(`[mic] paused, dropping ${buffer.length} bytes`);
-    }
-    if (sampleCount > 0 && typeof PortAudio.discardRecordedSamples === 'function') {
-      try {
-        PortAudio.discardRecordedSamples(sampleCount);
-      } catch (_) {}
-    }
-  };
-
-  return {
-    start() {
-      if (started) return;
-      PortAudio.initSampleBuffers(MIC_SAMPLE_RATE, MIC_SAMPLE_RATE, MIC_BLOCK_SIZE);
-      PortAudio.startMic();
-      paused = false;
-      stopped = false;
-      timer = setInterval(tick, MIC_TICK_MS);
-      started = true;
-    },
-    pause() {
-      paused = true;
-      onPause?.();
-      if (DEBUG_MIC) {
-        console.log('[mic] paused');
-      }
-    },
-    resume() {
-      if (!stopped) {
-        paused = false;
-        if (DEBUG_MIC) {
-          console.log('[mic] resumed');
-        }
-      }
-    },
-    shutdown() {
-      if (stopped) return;
-      stopped = true;
-      paused = true;
-      onShutdown?.();
-      if (timer) {
-        clearInterval(timer);
-        timer = null;
-      }
-      try {
-        PortAudio.stopMic();
-      } catch (_) {}
-      if (DEBUG_MIC) {
-        console.log('[mic] shutdown');
-      }
-    },
-  };
+  console.error('[voice-agent] ローカルマイク入力は削除されています。ブラウザ経由の音声のみを利用します。');
 }
 
 async function connectToRealtimeAPI() {
