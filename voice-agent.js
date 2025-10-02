@@ -4,11 +4,14 @@ import 'dotenv/config';
 import process from 'process';
 import OpenAI from 'openai';
 import { getToolDefinitions, routeToolCall } from './tool-router.js';
-import { AudioPlayer } from './audio-player.js';
 import { TtsClient } from './tts-client.js';
 import { PlaybackQueue } from './playback-queue.js';
-import WebSocket from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 import { createRequire } from 'module';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'fs';
+import http from 'http';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 if (!OPENAI_API_KEY) {
@@ -24,11 +27,93 @@ const MODEL_ID = process.env.OPENAI_MODEL ?? 'gpt-5-mini';
 const GROQ_MODEL_ID = process.env.GROQ_MODEL ?? 'gpt-oss-120b';
 const MAX_TOOL_ITERATIONS = Number.parseInt(process.env.VOICE_AGENT_TOOL_LOOP_MAX ?? '3', 10);
 const MAX_HISTORY_ITEMS = Number.parseInt(process.env.VOICE_AGENT_HISTORY_LIMIT ?? '20', 10);
+const enableLocalMic = (process.env.VOICE_AGENT_ENABLE_LOCAL_MIC ?? 'false').toLowerCase() !== 'false';
 
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const toolDefinitions = getToolDefinitions();
 const hasTools = toolDefinitions.length > 0;
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const browserClientPath = path.resolve(__dirname, 'browser-client.html');
+const HTTP_PORT = Number.parseInt(process.env.VOICE_AGENT_HTTP_PORT ?? '3000', 10);
+const BROWSER_WS_PORT = Number.parseInt(process.env.VOICE_AGENT_BROWSER_WS_PORT ?? '8080', 10);
+
+let browserClientHtml = '';
+try {
+  browserClientHtml = fs.readFileSync(browserClientPath, 'utf8');
+} catch (error) {
+  console.error(`[voice-agent] browser-client.html を読み込めませんでした: ${error.message}`);
+}
+
+const httpServer = http.createServer((req, res) => {
+  if (req.method !== 'GET') {
+    res.statusCode = 405;
+    res.end('Method Not Allowed');
+    return;
+  }
+  if (!browserClientHtml) {
+    res.statusCode = 500;
+    res.end('browser-client.html not available');
+    return;
+  }
+  const requestUrl = new URL(req.url ?? '/', `http://localhost:${HTTP_PORT}`);
+  if (requestUrl.pathname === '/favicon.ico') {
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
+  if (requestUrl.pathname === '/' || requestUrl.pathname === '/browser-client.html') {
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(browserClientHtml);
+    return;
+  }
+  res.statusCode = 404;
+  res.end('Not Found');
+});
+
+httpServer.listen(HTTP_PORT, () => {
+  console.error(`[voice-agent] ブラウザクライアントを開く: http://localhost:${HTTP_PORT}/`);
+});
+
+httpServer.on('error', (error) => {
+  console.error(`[voice-agent] HTTP サーバーエラー: ${error.message}`);
+});
+
+let browserWsServer = null;
+const browserClients = new Set();
+
+try {
+  browserWsServer = new WebSocketServer({ port: BROWSER_WS_PORT });
+  browserWsServer.on('connection', (socket, req) => {
+    const requestUrl = new URL(req.url ?? '/', `ws://localhost:${BROWSER_WS_PORT}`);
+    if (requestUrl.pathname !== '/audio') {
+      socket.close(1008, 'Invalid path');
+      return;
+    }
+    browserClients.add(socket);
+    socket.on('message', (data) => {
+      handleBrowserSocketMessage(socket, data);
+    });
+    socket.on('error', (error) => {
+      console.error(`[voice-agent] ブラウザWSエラー: ${error.message}`);
+    });
+    socket.on('close', () => {
+      browserClients.delete(socket);
+    });
+  });
+  browserWsServer.on('listening', () => {
+    console.error(`[voice-agent] ブラウザ音声 WebSocket: ws://localhost:${BROWSER_WS_PORT}/audio`);
+  });
+  browserWsServer.on('error', (error) => {
+    console.error(`[voice-agent] ブラウザ WebSocket サーバーエラー: ${error.message}`);
+  });
+} catch (error) {
+  console.error(`[voice-agent] ブラウザ用 WebSocket サーバーを開始できませんでした: ${error.message}`);
+}
 
 const ttsDisabledFlag = args.has('--no-tts');
 const ttsEnvDisabled = (process.env.VOICE_AGENT_TTS_ENABLED ?? 'true').toLowerCase() === 'false';
@@ -39,25 +124,18 @@ const ttsInstructions =
   '必ず日本語で読み上げ、数字は各桁を日本語の読みで発音してください。';
 
 let playbackQueue = null;
-let audioPlayerInstance = null;
 if (!ttsDisabledFlag && !ttsEnvDisabled) {
   try {
-    audioPlayerInstance = new AudioPlayer({
-      onStateChange: (state) => {
-        if (!micController) return;
-        if (state === 'start') {
-          micController.pause?.();
-        } else if (state === 'stop') {
-          micController.resume?.();
-        }
-      },
-    });
     const ttsClient = new TtsClient(client, {
       model: ttsModel,
       voice: ttsVoice,
       instructions: ttsInstructions,
     });
-    playbackQueue = new PlaybackQueue({ audioPlayer: audioPlayerInstance, ttsClient, enabled: true });
+    playbackQueue = new PlaybackQueue({
+      audioPlayer: createBrowserAudioOutput(),
+      ttsClient,
+      enabled: true,
+    });
   } catch (error) {
     console.error(`[voice-agent] TTS 初期化に失敗しました: ${error.message}`);
   }
@@ -144,6 +222,23 @@ function initiateShutdown(code, reason) {
       if (playbackQueue) {
         await playbackQueue.shutdown();
       }
+      if (browserWsServer) {
+        try {
+          for (const client of browserWsServer.clients) {
+            client.close();
+          }
+        } catch (_) {}
+        await new Promise((resolve) => {
+          browserWsServer.close(() => resolve());
+        });
+        browserWsServer = null;
+        browserClients.clear();
+      }
+      if (httpServer) {
+        await new Promise((resolve) => {
+          httpServer.close(() => resolve());
+        });
+      }
     } catch (error) {
       console.error(`[voice-agent] 終了処理エラー: ${error.message}`);
     } finally {
@@ -192,34 +287,38 @@ async function startRealtime() {
 
   sendSessionConfiguration();
 
-  micController = createMicController({
-    onChunk: (buffer) => {
-      if (!buffer || buffer.length === 0) return;
-      if (realtimeSocket?.readyState !== WebSocket.OPEN) return;
-      const base64 = buffer.toString('base64');
-      if (DEBUG_MIC) {
-        console.log(`[mic] append bytes=${buffer.length} base64=${base64.length}`);
-      }
-      realtimeSocket.send(
-        JSON.stringify({
-          type: 'input_audio_buffer.append',
-          audio: base64,
-        })
-      );
-    },
-    onPause: () => {
-      // drop buffered audio on pause to avoid leaking playback audio
-    },
-    onShutdown: () => {
-      // nothing to flush; rely on server VAD
-    },
-  });
+  if (enableLocalMic) {
+    micController = createMicController({
+      onChunk: (buffer) => {
+        if (!buffer || buffer.length === 0) return;
+        if (realtimeSocket?.readyState !== WebSocket.OPEN) return;
+        const base64 = buffer.toString('base64');
+        if (DEBUG_MIC) {
+          console.log(`[mic] append bytes=${buffer.length} base64=${base64.length}`);
+        }
+        realtimeSocket.send(
+          JSON.stringify({
+            type: 'input_audio_buffer.append',
+            audio: base64,
+          })
+        );
+      },
+      onPause: () => {
+        // drop buffered audio on pause to avoid leaking playback audio
+      },
+      onShutdown: () => {
+        // nothing to flush; rely on server VAD
+      },
+    });
 
-  try {
-    micController.start();
-  } catch (error) {
-    console.error(`[voice-agent] マイク開始失敗: ${error.message}`);
-    initiateShutdown(1, null);
+    try {
+      micController.start();
+    } catch (error) {
+      console.error(`[voice-agent] マイク開始失敗: ${error.message}`);
+      initiateShutdown(1, null);
+    }
+  } else {
+    console.error('[voice-agent] ローカルマイク入力は無効化されています (VOICE_AGENT_ENABLE_LOCAL_MIC=false)');
   }
 }
 
@@ -377,6 +476,161 @@ function sendSessionConfiguration() {
   );
 }
 
+function handleBrowserSocketMessage(socket, data) {
+  if (!data) {
+    return;
+  }
+  let payload;
+  try {
+    const text = typeof data === 'string' ? data : data.toString();
+    payload = JSON.parse(text);
+  } catch (error) {
+    socket.send(JSON.stringify({ type: 'error', message: `invalid payload: ${error.message}` }));
+    return;
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    socket.send(JSON.stringify({ type: 'error', message: 'payload must be an object' }));
+    return;
+  }
+
+  switch (payload.type) {
+    case 'config': {
+      socket.send(JSON.stringify({ type: 'ack', message: 'config received' }));
+      break;
+    }
+    case 'audio': {
+      const audioBase64 = typeof payload.data === 'string' ? payload.data : null;
+      if (!audioBase64) {
+        socket.send(JSON.stringify({ type: 'error', message: 'audio data missing' }));
+        return;
+      }
+      const level = calculateLevelFromBase64(audioBase64);
+      if (Number.isFinite(level)) {
+        socket.send(
+          JSON.stringify({ type: 'server_level', level })
+        );
+      }
+      if (!forwardAudioBase64(audioBase64)) {
+        socket.send(JSON.stringify({ type: 'error', message: 'realtime socket not ready' }));
+      }
+      break;
+    }
+    case 'end': {
+      if (!commitBrowserAudio()) {
+        socket.send(JSON.stringify({ type: 'error', message: 'failed to commit audio' }));
+      } else {
+        socket.send(JSON.stringify({ type: 'ack', message: 'audio committed' }));
+      }
+      break;
+    }
+    case 'ping': {
+      socket.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+      break;
+    }
+    default: {
+      socket.send(JSON.stringify({ type: 'error', message: 'unknown type' }));
+      break;
+    }
+  }
+}
+
+function forwardAudioBase64(base64) {
+  if (!realtimeSocket || realtimeSocket.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  try {
+    realtimeSocket.send(
+      JSON.stringify({
+        type: 'input_audio_buffer.append',
+        audio: base64,
+      })
+    );
+    return true;
+  } catch (error) {
+    console.error(`[voice-agent] 音声フレーム転送エラー: ${error.message}`);
+    return false;
+  }
+}
+
+function commitBrowserAudio() {
+  if (!realtimeSocket || realtimeSocket.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  try {
+    realtimeSocket.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+    return true;
+  } catch (error) {
+    console.error(`[voice-agent] 音声コミットエラー: ${error.message}`);
+    return false;
+  }
+}
+
+function calculateLevelFromBase64(base64) {
+  if (!base64 || typeof base64 !== 'string') {
+    return 0;
+  }
+  const audioBuffer = Buffer.from(base64, 'base64');
+  if (!audioBuffer || audioBuffer.length < 2) {
+    return 0;
+  }
+  const sampleCount = Math.floor(audioBuffer.length / 2);
+  if (sampleCount === 0) {
+    return 0;
+  }
+  let sumSquares = 0;
+  for (let i = 0; i < sampleCount; i += 1) {
+    const sample = audioBuffer.readInt16LE(i * 2);
+    sumSquares += sample * sample;
+  }
+  if (sumSquares === 0) {
+    return 0;
+  }
+  const rms = Math.sqrt(sumSquares / sampleCount);
+  return Math.max(0, Math.min(1, rms / 32768));
+}
+
+function broadcastToBrowserClients(payload) {
+  if (!payload) {
+    return;
+  }
+  let message;
+  try {
+    message = JSON.stringify(payload);
+  } catch (error) {
+    console.error(`[voice-agent] ブロードキャスト失敗 (JSON 化エラー): ${error.message}`);
+    return;
+  }
+  for (const client of browserClients) {
+    if (client.readyState !== WebSocket.OPEN) continue;
+    try {
+      client.send(message);
+    } catch (error) {
+      console.error(`[voice-agent] ブラウザ送信エラー: ${error.message}`);
+    }
+  }
+}
+
+function createBrowserAudioOutput() {
+  return {
+    enqueue(samples, sampleRate) {
+      if (!(samples instanceof Int16Array)) {
+        return;
+      }
+      const buffer = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
+      const base64 = buffer.toString('base64');
+      broadcastToBrowserClients({
+        type: 'tts',
+        sampleRate,
+        audio: base64,
+      });
+    },
+    async shutdown() {
+      // no-op for browser audio
+    },
+  };
+}
+
 async function handleRealtimeMessage(data) {
   let message;
   try {
@@ -458,6 +712,7 @@ async function runTurn({ text, timestamp }) {
       console.log(`[assistant] ${output}`);
       addToConversation(createMessage('assistant', output));
       playbackQueue?.enqueue({ text: output });
+      broadcastToBrowserClients({ type: 'assistant_text', text: output });
     });
 
     if (!toolCalls.length) {

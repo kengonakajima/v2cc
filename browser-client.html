@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Voice Agent Browser Client</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 0;
+      padding: 24px;
+      background: #f4f6f8;
+      color: #222;
+    }
+    h1 {
+      font-size: 1.4rem;
+      margin-bottom: 16px;
+    }
+    .panel {
+      background: #fff;
+      border-radius: 8px;
+      padding: 16px;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      max-width: 720px;
+    }
+    label {
+      display: block;
+      margin-top: 12px;
+      font-weight: 600;
+    }
+    input, select, button {
+      margin-top: 6px;
+      font-size: 1rem;
+      padding: 6px 10px;
+    }
+    button {
+      cursor: pointer;
+      border-radius: 4px;
+      border: 1px solid #888;
+      background: #f0f0f0;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 16px;
+    }
+    .meter {
+      margin-top: 20px;
+    }
+    .meter-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.9rem;
+      margin-bottom: 4px;
+    }
+    .level-meter {
+      position: relative;
+      width: 100%;
+      height: 10px;
+      background: #ddd;
+      border-radius: 5px;
+      overflow: hidden;
+    }
+    .level-bar {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #4caf50, #ff9800);
+      transition: width 0.08s linear;
+    }
+    #log {
+      margin-top: 16px;
+      background: #111;
+      color: #f8f8f2;
+      padding: 12px;
+      border-radius: 6px;
+      height: 220px;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 0.88rem;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h1>Voice Agent Browser Client</h1>
+    <p>ブラウザのマイク入力を WebSocket でサーバーへ送信します。</p>
+
+    <label for="serverUrl">WebSocket サーバー URL</label>
+    <input id="serverUrl" type="text" value="ws://localhost:8080/audio" size="40" />
+
+    <div class="controls">
+      <button id="permissionButton">マイク許可をリクエスト</button>
+      <button id="refreshButton">デバイス再取得</button>
+    </div>
+
+    <label for="deviceSelect">マイクデバイス</label>
+    <select id="deviceSelect"></select>
+
+    <div class="controls">
+      <button id="connectButton">WS 接続</button>
+      <button id="disconnectButton" disabled>WS 切断</button>
+    </div>
+
+    <div class="controls">
+      <button id="startButton" disabled>送信開始</button>
+      <button id="stopButton" disabled>送信停止</button>
+    </div>
+
+    <div class="meter">
+      <div class="meter-header">
+        <span>送信レベル</span>
+        <span id="clientLevelValue">0%</span>
+      </div>
+      <div class="level-meter">
+        <div class="level-bar" id="clientLevelBar"></div>
+      </div>
+    </div>
+
+    <div class="meter">
+      <div class="meter-header">
+        <span>サーバー受信レベル</span>
+        <span id="serverLevelValue">0%</span>
+      </div>
+      <div class="level-meter">
+        <div class="level-bar" id="serverLevelBar"></div>
+      </div>
+    </div>
+
+    <div id="log"></div>
+  </div>
+
+  <script>
+    const logArea = document.getElementById('log');
+    const serverUrlInput = document.getElementById('serverUrl');
+    const permissionButton = document.getElementById('permissionButton');
+    const refreshButton = document.getElementById('refreshButton');
+    const deviceSelect = document.getElementById('deviceSelect');
+    const connectButton = document.getElementById('connectButton');
+    const disconnectButton = document.getElementById('disconnectButton');
+    const startButton = document.getElementById('startButton');
+    const stopButton = document.getElementById('stopButton');
+    const clientLevelBar = document.getElementById('clientLevelBar');
+    const serverLevelBar = document.getElementById('serverLevelBar');
+    const clientLevelValue = document.getElementById('clientLevelValue');
+    const serverLevelValue = document.getElementById('serverLevelValue');
+
+    const TARGET_SAMPLE_RATE = 24000;
+    const CHUNK_SIZE = 4096;
+
+    let ws = null;
+    let mediaStream = null;
+    let recordingContext = null;
+    let sourceNode = null;
+    let processorNode = null;
+    let selectedDeviceId = null;
+    let playbackContext = null;
+    const playbackQueue = [];
+    let isPlaybackRunning = false;
+
+    function appendLog(message) {
+      const now = new Date().toLocaleTimeString();
+      logArea.textContent += `[${now}] ${message}\n`;
+      logArea.scrollTop = logArea.scrollHeight;
+    }
+
+    function updateLevel(bar, label, value) {
+      const level = Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
+      bar.style.width = `${(level * 100).toFixed(0)}%`;
+      label.textContent = `${(level * 100).toFixed(0)}%`;
+    }
+
+    function updateClientLevel(value) {
+      updateLevel(clientLevelBar, clientLevelValue, value);
+    }
+
+    function updateServerLevel(value) {
+      updateLevel(serverLevelBar, serverLevelValue, value);
+    }
+
+    function ensureDeviceOptions() {
+      navigator.mediaDevices.enumerateDevices().then((devices) => {
+        const audioInputs = devices.filter((device) => device.kind === 'audioinput');
+        deviceSelect.innerHTML = '';
+        audioInputs.forEach((device) => {
+          const option = document.createElement('option');
+          option.value = device.deviceId;
+          option.textContent = device.label || `マイク (${device.deviceId})`;
+          deviceSelect.appendChild(option);
+        });
+        if (audioInputs.length === 0) {
+          const option = document.createElement('option');
+          option.value = '';
+          option.textContent = '利用可能なマイクが見つかりません';
+          deviceSelect.appendChild(option);
+        }
+        if (audioInputs.length > 0) {
+          selectedDeviceId = audioInputs[0].deviceId;
+        }
+      }).catch((error) => {
+        appendLog(`デバイス取得エラー: ${error.message}`);
+      });
+    }
+
+    function requestMicrophonePermission() {
+      navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+        appendLog('マイク許可が付与されました');
+        stream.getTracks().forEach((track) => track.stop());
+        ensureDeviceOptions();
+      }).catch((error) => {
+        appendLog(`マイク許可が拒否されました: ${error.message}`);
+      });
+    }
+
+    function openWebSocket() {
+      const url = serverUrlInput.value.trim();
+      if (!url) {
+        appendLog('WebSocket URL を入力してください');
+        return;
+      }
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        appendLog('既に WebSocket が開いています');
+        return;
+      }
+      ws = new WebSocket(url);
+      connectButton.disabled = true;
+      disconnectButton.disabled = false;
+      startButton.disabled = true;
+      appendLog(`WebSocket 接続中: ${url}`);
+
+      ws.addEventListener('open', () => {
+        appendLog('WebSocket 接続が開きました');
+        startButton.disabled = false;
+        sendStreamConfig();
+      });
+
+      ws.addEventListener('message', (event) => {
+        handleServerMessage(event.data);
+      });
+
+      ws.addEventListener('close', () => {
+        appendLog('WebSocket 接続が閉じられました');
+        cleanupWebSocket();
+      });
+
+      ws.addEventListener('error', (event) => {
+        appendLog('WebSocket エラーが発生しました');
+        if (event.message) {
+          appendLog(`エラー詳細: ${event.message}`);
+        }
+      });
+    }
+
+    function cleanupWebSocket() {
+      connectButton.disabled = false;
+      disconnectButton.disabled = true;
+      startButton.disabled = true;
+      stopButton.disabled = true;
+      ws = null;
+      updateServerLevel(0);
+    }
+
+    function closeWebSocket() {
+      if (ws) {
+        ws.close();
+      }
+      cleanupWebSocket();
+    }
+
+    function sendStreamConfig() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const metadata = {
+        type: 'config',
+        sampleRate: TARGET_SAMPLE_RATE,
+        format: 'pcm16',
+        channels: 1,
+      };
+      ws.send(JSON.stringify(metadata));
+    }
+
+    function handleDeviceSelectionChange(event) {
+      selectedDeviceId = event.target.value;
+    }
+
+    function startStreaming() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        appendLog('WebSocket 接続を開いてから送信を開始してください');
+        return;
+      }
+      if (mediaStream) {
+        appendLog('既に送信中です');
+        return;
+      }
+      const constraints = { audio: selectedDeviceId ? { deviceId: { exact: selectedDeviceId } } : true };
+      navigator.mediaDevices.getUserMedia(constraints).then((stream) => {
+        mediaStream = stream;
+        recordingContext = new AudioContext();
+        sourceNode = recordingContext.createMediaStreamSource(stream);
+        processorNode = recordingContext.createScriptProcessor(CHUNK_SIZE, 1, 1);
+        processorNode.onaudioprocess = (event) => {
+          const inputBuffer = event.inputBuffer.getChannelData(0);
+          const downsampled = downsampleBuffer(inputBuffer, recordingContext.sampleRate, TARGET_SAMPLE_RATE);
+          if (!downsampled) {
+            return;
+          }
+          if (downsampled.length) {
+            let sumSquares = 0;
+            for (let i = 0; i < downsampled.length; i += 1) {
+              const sample = downsampled[i];
+              sumSquares += sample * sample;
+            }
+            const rms = Math.sqrt(sumSquares / downsampled.length);
+            updateClientLevel(rms);
+          } else {
+            updateClientLevel(0);
+          }
+          const pcmBuffer = floatTo16BitPCM(downsampled);
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            const payload = {
+              type: 'audio',
+              data: arrayBufferToBase64(pcmBuffer),
+            };
+            ws.send(JSON.stringify(payload));
+          }
+        };
+        sourceNode.connect(processorNode);
+        processorNode.connect(recordingContext.destination);
+        appendLog('音声送信を開始しました');
+        startButton.disabled = true;
+        stopButton.disabled = false;
+      }).catch((error) => {
+        appendLog(`音声取得に失敗しました: ${error.message}`);
+      });
+    }
+
+    function stopStreaming() {
+      if (processorNode) {
+        processorNode.disconnect();
+        processorNode.onaudioprocess = null;
+        processorNode = null;
+      }
+      if (sourceNode) {
+        sourceNode.disconnect();
+        sourceNode = null;
+      }
+      if (recordingContext) {
+        recordingContext.close();
+        recordingContext = null;
+      }
+      if (mediaStream) {
+        mediaStream.getTracks().forEach((track) => track.stop());
+        mediaStream = null;
+      }
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const endMessage = { type: 'end' };
+        ws.send(JSON.stringify(endMessage));
+      }
+      appendLog('音声送信を停止しました');
+      startButton.disabled = false;
+      stopButton.disabled = true;
+      updateClientLevel(0);
+      updateServerLevel(0);
+    }
+
+    function handleServerMessage(raw) {
+      let payload;
+      try {
+        payload = typeof raw === 'string' ? JSON.parse(raw) : JSON.parse(raw.toString());
+      } catch (error) {
+        appendLog(`サーバーメッセージ解析エラー: ${error.message}`);
+        return;
+      }
+      switch (payload.type) {
+        case 'ack':
+          appendLog(`サーバー: ${payload.message ?? 'ACK'}`);
+          break;
+        case 'server_level':
+          updateServerLevel(payload.level ?? 0);
+          break;
+        case 'error':
+          appendLog(`サーバーエラー: ${payload.message ?? '詳細不明'}`);
+          break;
+        case 'assistant_text':
+          if (payload.text) {
+            appendLog(`AI: ${payload.text}`);
+          }
+          break;
+        case 'tts':
+          enqueueTtsPlayback(payload);
+          break;
+        case 'pong':
+          appendLog('サーバーから pong');
+          break;
+        default:
+          appendLog(`未知のメッセージ: ${JSON.stringify(payload)}`);
+      }
+    }
+
+    function downsampleBuffer(buffer, inputSampleRate, targetRate) {
+      if (!buffer) {
+        return null;
+      }
+      if (targetRate === inputSampleRate) {
+        return buffer.slice();
+      }
+      if (targetRate > inputSampleRate) {
+        appendLog('ターゲットのサンプリングレートが入力より大きいため、そのまま送信します');
+        return buffer.slice();
+      }
+      const sampleRateRatio = inputSampleRate / targetRate;
+      const newLength = Math.round(buffer.length / sampleRateRatio);
+      const result = new Float32Array(newLength);
+      let offsetResult = 0;
+      let offsetBuffer = 0;
+      while (offsetResult < result.length) {
+        const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+        let accum = 0;
+        let count = 0;
+        for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i += 1) {
+          accum += buffer[i];
+          count += 1;
+        }
+        result[offsetResult] = count ? accum / count : 0;
+        offsetResult += 1;
+        offsetBuffer = nextOffsetBuffer;
+      }
+      return result;
+    }
+
+    function floatTo16BitPCM(float32Array) {
+      const buffer = new ArrayBuffer(float32Array.length * 2);
+      const view = new DataView(buffer);
+      for (let i = 0; i < float32Array.length; i += 1) {
+        let sample = float32Array[i];
+        if (sample > 1) {
+          sample = 1;
+        }
+        if (sample < -1) {
+          sample = -1;
+        }
+        view.setInt16(i * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+      }
+      return buffer;
+    }
+
+    function arrayBufferToBase64(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      const chunkSize = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode.apply(null, chunk);
+      }
+      return btoa(binary);
+    }
+
+    function base64ToInt16(base64) {
+      const binary = atob(base64);
+      const buffer = new ArrayBuffer(binary.length);
+      const bytes = new Uint8Array(buffer);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return new Int16Array(buffer);
+    }
+
+    function ensurePlaybackContext(targetSampleRate = TARGET_SAMPLE_RATE) {
+      if (!playbackContext) {
+        try {
+          playbackContext = new AudioContext();
+        } catch (error) {
+          appendLog(`再生用 AudioContext の作成に失敗しました: ${error.message}`);
+          return null;
+        }
+      }
+      if (playbackContext.state === 'suspended') {
+        playbackContext.resume().catch((error) => {
+          appendLog(`AudioContext を resume できませんでした: ${error.message}`);
+        });
+      }
+      return playbackContext;
+    }
+
+    function enqueueTtsPlayback(payload) {
+      if (!payload || typeof payload.audio !== 'string') {
+        return;
+      }
+      const ctx = ensurePlaybackContext(payload.sampleRate || TARGET_SAMPLE_RATE);
+      if (!ctx) {
+        return;
+      }
+      const int16 = base64ToInt16(payload.audio);
+      if (!int16.length) {
+        return;
+      }
+      const sampleRate = payload.sampleRate || TARGET_SAMPLE_RATE;
+      const audioBuffer = ctx.createBuffer(1, int16.length, sampleRate);
+      const channel = audioBuffer.getChannelData(0);
+      for (let i = 0; i < int16.length; i += 1) {
+        channel[i] = int16[i] / 32768;
+      }
+      playbackQueue.push(audioBuffer);
+      if (!isPlaybackRunning) {
+        playNextTtsBuffer();
+      }
+    }
+
+    function playNextTtsBuffer() {
+      if (!playbackQueue.length || !playbackContext) {
+        isPlaybackRunning = false;
+        return;
+      }
+      isPlaybackRunning = true;
+      const buffer = playbackQueue.shift();
+      const source = playbackContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(playbackContext.destination);
+      source.onended = () => {
+        playNextTtsBuffer();
+      };
+      source.start();
+    }
+
+    permissionButton.addEventListener('click', requestMicrophonePermission);
+    refreshButton.addEventListener('click', ensureDeviceOptions);
+    deviceSelect.addEventListener('change', handleDeviceSelectionChange);
+    connectButton.addEventListener('click', () => {
+      ensurePlaybackContext();
+      openWebSocket();
+    });
+    disconnectButton.addEventListener('click', () => {
+      stopStreaming();
+      closeWebSocket();
+    });
+    startButton.addEventListener('click', startStreaming);
+    stopButton.addEventListener('click', stopStreaming);
+
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      ensureDeviceOptions();
+    } else {
+      appendLog('このブラウザは mediaDevices API をサポートしていません');
+    }
+
+    updateClientLevel(0);
+    updateServerLevel(0);
+  </script>
+</body>
+</html>
