@@ -1,0 +1,42 @@
+# 音声→LLMツール呼び出し 設計案
+
+## 1. ゴールと前提
+- マイク音声を `transcribe.js` で Whisper (Realtime API) に渡し、部分結果/確定結果のテキストイベントを得る。
+- GPT-5 などツール呼び出し対応 LLM にテキストを与え、音声経由のユーザー指示で外部ツールを安全に実行する。
+- Realtime API によるサーバ側 VAD と tool calling 機能、ならびに GPT-5 のツール活用能力を前提にする。
+
+## 2. 全体構成
+```
+[マイク入力]
+    ↓
+transcribe.js (既存) --stdout--> voice-agent.js
+    ↓                                   ↓
+{type, text, ts}                    会話状態 + ツール定義
+                                        ↓
+                                GPT-5 Responses API
+                                   ↓      ↓
+                         model出力   function_call
+                                   ↓      ↓
+                                 TTSやAPIレスポンス   tool-router.js
+                                             ↓
+                                        実際の各種ツール
+```
+
+## 3. プロセス分離と通信
+- `transcribe.js` はこれまで通り `console.log` を使い、行頭にタグを付ける（例: `[partial]\t...`, `[final]\t...`).
+- 新規プロセス `voice-agent.js` が `transcribe.js` を child_process で起動し、`stdout` を行単位で購読してテキストイベントを得る。
+- `voice-agent.js` 側で部分結果は連結バッファに保持し、`[final]` 到着時に対話メッセージとして LLM に送る。
+
+## 4. LLM 連携層
+- 使用 API: OpenAI Responses API (`POST /v1/responses`) を想定。モデルは `gpt-5` / `gpt-5-mini` を選択可能。
+- `voice-agent.js` は Conversation state を保持し、以下を送る:
+  - system: 音声入力であること、必要なら部分結果の扱い方。
+  - user: `[final]` で確定したテキスト。
+  - tools: JSON Schema で定義したアクション群（例: Google Calendar 作成、Home Assistant 操作など）。
+  - `tool_choice: "auto"` を設定してモデルの自動選択を許可。
+- レイテンシ対策で streaming モード (`stream: true`) を利用し、パーシャルテキスト出力をそのまま TTS に流用できる設計。
+
+## 5. ツール呼び出しハンドラー
+- `tool-router.js` を新設。LLM から戻る `tool_calls` を受け取り、ツール名でディスパッチ。
+- それぞれのツールハンドラーは Promise を返し、成功結果/エラーを `voice-agent.js` 経由で Responses API に `response.create` → `tool_output` として再送する。
+- ツール実行結果は必要に応じて `console.log` でロギングし、音声応答用のテキストを LLM へ返却。
