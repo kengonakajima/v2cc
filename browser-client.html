@@ -388,6 +388,13 @@
         case 'server_level':
           updateServerLevel(payload.level ?? 0);
           break;
+        case 'meeting_record':
+          if (payload.text) {
+            appendLog(`記録: ${payload.text}`);
+          } else {
+            appendLog('記録: (詳細不明)');
+          }
+          break;
         case 'error':
           appendLog(`サーバーエラー: ${payload.message ?? '詳細不明'}`);
           break;

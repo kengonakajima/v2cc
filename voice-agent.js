@@ -39,6 +39,7 @@ const __dirname = path.dirname(__filename);
 const browserClientPath = path.resolve(__dirname, 'browser-client.html');
 const HTTP_PORT = Number.parseInt(process.env.VOICE_AGENT_HTTP_PORT ?? '3000', 10);
 const BROWSER_WS_PORT = Number.parseInt(process.env.VOICE_AGENT_BROWSER_WS_PORT ?? '8080', 10);
+const MEETING_NOTES_PATH = path.resolve(__dirname, 'meeting-notes.log');
 
 let browserClientHtml = '';
 try {
@@ -185,7 +186,10 @@ const baseSystemPrompt =
     '- When a custom tool is required, choose it and explain the action in Japanese.\n' +
     '- Speak in natural conversational Japanese. Avoid written list formatting, emojis, excessive symbols, or long strings of numbers. Keep responses brief.\n' +
     '- Prefer sentences no longer than about 30 Japanese characters; insert a line break before starting a new short sentence.\n' +
-    '- ユーザから明確な依頼・質問があった場合だけ内容を短く復唱してから回答を始めること。挨拶や雑談など依頼でない発言には復唱を入れない。\n' +
+    '- 会議コンパニオンとして常に傾聴し、議事録はシステム側で自動保存される前提で振る舞う。\n' +
+    '- 明確な依頼やあなたの名前「SuperSlack」を含む直接の呼びかけがあるときだけ応答し、冒頭で依頼内容を手短に復唱してから答える。\n' +
+    '- 依頼が無い発話には応答メッセージを出さない。\n' +
+    '- 不要な確認や促し（例: 「何かご用はありますか？」）を繰り返さない。\n' +
     '- When mathematical expressions are needed, describe them verbally without mathematical symbols so they are easy to speak aloud.';
 
 addToConversation(createMessage('system', baseSystemPrompt));
@@ -632,6 +636,24 @@ function createBrowserAudioOutput() {
   };
 }
 
+async function logMeetingNote(text, isoTimestamp) {
+  const trimmed = typeof text === 'string' ? text.trim() : '';
+  if (!trimmed) {
+    return;
+  }
+  const timestamp = isoTimestamp ?? new Date().toISOString();
+  try {
+    await fs.promises.appendFile(MEETING_NOTES_PATH, `[${timestamp}] ${trimmed}\n`, 'utf8');
+    console.log(`[meeting-note] saved ${timestamp} -> ${trimmed}`);
+  } catch (error) {
+    console.error(`[voice-agent] 議事録書き込み失敗: ${error.message}`);
+    return;
+  }
+  broadcastToBrowserClients({ type: 'meeting_record', text: trimmed, timestamp });
+}
+
+const SILENT_RESPONSES = new Set(['（静かに傾聴）', '（応答なし）', '(silence)', '(no response)']);
+
 async function handleRealtimeMessage(data) {
   let message;
   try {
@@ -709,12 +731,16 @@ async function runTurn({ text, timestamp }) {
       ({ textOutputs, toolCalls } = dissectResponse(response));
     }
 
-    textOutputs.forEach((output) => {
-      console.log(`[assistant] ${output}`);
-      addToConversation(createMessage('assistant', output));
-      playbackQueue?.enqueue({ text: output });
-      broadcastToBrowserClients({ type: 'assistant_text', text: output });
-    });
+    for (const output of textOutputs) {
+      const text = typeof output === 'string' ? output.trim() : '';
+      if (!text || SILENT_RESPONSES.has(text)) {
+        continue;
+      }
+      console.log(`[assistant] ${text}`);
+      addToConversation(createMessage('assistant', text));
+      playbackQueue?.enqueue({ text });
+      broadcastToBrowserClients({ type: 'assistant_text', text });
+    }
 
     if (!toolCalls.length) {
       continueLoop = false;
@@ -1043,6 +1069,8 @@ async function handleFinalTranscript(raw) {
   lastPartialTranscript = '';
   process.stdout.write('\r');
   console.log(`[speech:final] ${normalized}`);
+  const occurredAtIso = new Date().toISOString();
+  await logMeetingNote(normalized, occurredAtIso);
   enqueueUtterance({ text: normalized, timestamp: Date.now() });
 }
 
