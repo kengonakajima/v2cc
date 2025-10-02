@@ -114,6 +114,7 @@
     <div class="controls">
       <button id="startButton" disabled>送信開始</button>
       <button id="stopButton" disabled>送信停止</button>
+      <button id="interruptButton" disabled>応答停止</button>
     </div>
 
     <div class="meter">
@@ -149,6 +150,7 @@
     const disconnectButton = document.getElementById('disconnectButton');
     const startButton = document.getElementById('startButton');
     const stopButton = document.getElementById('stopButton');
+    const interruptButton = document.getElementById('interruptButton');
     const clientLevelBar = document.getElementById('clientLevelBar');
     const serverLevelBar = document.getElementById('serverLevelBar');
     const clientLevelValue = document.getElementById('clientLevelValue');
@@ -166,6 +168,8 @@
     let playbackContext = null;
     const playbackQueue = [];
     let isPlaybackRunning = false;
+    let playbackSuspended = false;
+    let activeTtsSource = null;
 
     function appendLog(message) {
       const now = new Date().toLocaleTimeString();
@@ -240,6 +244,9 @@
       ws.addEventListener('open', () => {
         appendLog('WebSocket 接続が開きました');
         startButton.disabled = false;
+        interruptButton.disabled = false;
+        playbackSuspended = false;
+        interruptButton.textContent = '応答停止';
         sendStreamConfig();
       });
 
@@ -265,6 +272,10 @@
       disconnectButton.disabled = true;
       startButton.disabled = true;
       stopButton.disabled = true;
+      interruptButton.disabled = true;
+      stopAllPlayback();
+      playbackSuspended = false;
+      interruptButton.textContent = '応答停止';
       ws = null;
       updateServerLevel(0);
     }
@@ -371,6 +382,7 @@
       stopButton.disabled = true;
       updateClientLevel(0);
       updateServerLevel(0);
+      stopAllPlayback();
     }
 
     function handleServerMessage(raw) {
@@ -503,6 +515,9 @@
       if (!payload || typeof payload.audio !== 'string') {
         return;
       }
+      if (playbackSuspended) {
+        return;
+      }
       const ctx = ensurePlaybackContext(payload.sampleRate || TARGET_SAMPLE_RATE);
       if (!ctx) {
         return;
@@ -524,19 +539,50 @@
     }
 
     function playNextTtsBuffer() {
-      if (!playbackQueue.length || !playbackContext) {
+      if (!playbackQueue.length || !playbackContext || playbackSuspended) {
         isPlaybackRunning = false;
         return;
       }
       isPlaybackRunning = true;
       const buffer = playbackQueue.shift();
       const source = playbackContext.createBufferSource();
+      activeTtsSource = source;
       source.buffer = buffer;
       source.connect(playbackContext.destination);
       source.onended = () => {
-        playNextTtsBuffer();
+        if (activeTtsSource === source) {
+          activeTtsSource = null;
+        }
+        if (playbackSuspended) {
+          isPlaybackRunning = false;
+        } else {
+          playNextTtsBuffer();
+        }
       };
       source.start();
+    }
+
+    function stopAllPlayback() {
+      playbackQueue.length = 0;
+      if (activeTtsSource) {
+        try {
+          activeTtsSource.stop();
+        } catch (_) {}
+        activeTtsSource.disconnect();
+        activeTtsSource = null;
+      }
+      isPlaybackRunning = false;
+    }
+
+    function togglePlaybackSuspension() {
+      playbackSuspended = !playbackSuspended;
+      if (playbackSuspended) {
+        interruptButton.textContent = '応答再開';
+        stopAllPlayback();
+      } else {
+        interruptButton.textContent = '応答停止';
+        playNextTtsBuffer();
+      }
     }
 
     permissionButton.addEventListener('click', requestMicrophonePermission);
@@ -552,6 +598,7 @@
     });
     startButton.addEventListener('click', startStreaming);
     stopButton.addEventListener('click', stopStreaming);
+    interruptButton.addEventListener('click', togglePlaybackSuspension);
 
     if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
       ensureDeviceOptions();
@@ -561,6 +608,7 @@
 
     updateClientLevel(0);
     updateServerLevel(0);
+    interruptButton.textContent = '応答停止';
   </script>
 </body>
 </html>
