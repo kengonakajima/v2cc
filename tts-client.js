@@ -37,10 +37,11 @@ function splitIntoSegments(text) {
 }
 
 export class TtsClient {
-  constructor(openai, { model = 'gpt-4o-mini-tts', voice = 'alloy' } = {}) {
+  constructor(openai, { model = 'gpt-4o-mini-tts', voice = 'alloy', instructions = null } = {}) {
     this.client = openai;
     this.model = model;
     this.voice = voice;
+    this.instructions = instructions;
   }
 
   async synthesize(text) {
@@ -55,6 +56,7 @@ export class TtsClient {
           voice: this.voice,
           input: segment,
           response_format: 'pcm',
+          ...(this.instructions ? { instructions: this.instructions } : {}),
         });
         const arrayBuffer = await response.arrayBuffer();
         const samples = new Int16Array(arrayBuffer);

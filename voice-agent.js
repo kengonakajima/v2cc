@@ -34,6 +34,9 @@ const ttsDisabledFlag = args.has('--no-tts');
 const ttsEnvDisabled = (process.env.VOICE_AGENT_TTS_ENABLED ?? 'true').toLowerCase() === 'false';
 const ttsModel = process.env.VOICE_AGENT_TTS_MODEL ?? 'gpt-4o-mini-tts';
 const ttsVoice = process.env.VOICE_AGENT_TTS_VOICE ?? 'alloy';
+const ttsInstructions =
+  process.env.VOICE_AGENT_TTS_INSTRUCTIONS ??
+  '必ず日本語で読み上げ、数字は各桁を日本語の読みで発音してください。';
 
 let playbackQueue = null;
 let audioPlayerInstance = null;
@@ -49,7 +52,11 @@ if (!ttsDisabledFlag && !ttsEnvDisabled) {
         }
       },
     });
-    const ttsClient = new TtsClient(client, { model: ttsModel, voice: ttsVoice });
+    const ttsClient = new TtsClient(client, {
+      model: ttsModel,
+      voice: ttsVoice,
+      instructions: ttsInstructions,
+    });
     playbackQueue = new PlaybackQueue({ audioPlayer: audioPlayerInstance, ttsClient, enabled: true });
   } catch (error) {
     console.error(`[voice-agent] TTS 初期化に失敗しました: ${error.message}`);
