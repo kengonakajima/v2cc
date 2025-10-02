@@ -589,15 +589,40 @@ function normalizeToolsForChat(tools) {
     if (!tool || tool.type !== 'function') {
       return tool;
     }
+    const parameters = adaptGroqToolParameters(tool.parameters);
     return {
       type: 'function',
       function: {
         name: tool.name,
         description: tool.description,
-        parameters: tool.parameters,
+        parameters,
       },
     };
   });
+}
+
+function adaptGroqToolParameters(schema) {
+  if (!schema || typeof schema !== 'object') {
+    return schema;
+  }
+
+  const clone = JSON.parse(JSON.stringify(schema));
+  const requiredSet = new Set(Array.isArray(clone.required) ? clone.required : []);
+  if (clone.properties && typeof clone.properties === 'object') {
+    for (const [key, value] of Object.entries(clone.properties)) {
+      if (!value || typeof value !== 'object') continue;
+      if (requiredSet.has(key)) continue;
+      const currentType = value.type;
+      if (typeof currentType === 'string') {
+        if (currentType !== 'null') {
+          value.type = [currentType, 'null'];
+        }
+      } else if (Array.isArray(currentType) && !currentType.includes('null')) {
+        value.type = [...currentType, 'null'];
+      }
+    }
+  }
+  return clone;
 }
 
 function convertConversationToGroqMessages(items) {

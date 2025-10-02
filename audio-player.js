@@ -1,3 +1,4 @@
+import process from 'process';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -5,6 +6,8 @@ const require = createRequire(import.meta.url);
 const PLAYBACK_SAMPLE_RATE = 24000;
 const BLOCK_SIZE = 960; // 40ms @ 24kHz
 const TICK_MS = Math.round((BLOCK_SIZE / PLAYBACK_SAMPLE_RATE) * 1000);
+const PREFILL_MS = Math.max(0, Number.parseInt(process.env.VOICE_AGENT_AUDIO_PREFILL_MS ?? '100', 10));
+const PREFILL_SAMPLES = Math.round((PLAYBACK_SAMPLE_RATE * PREFILL_MS) / 1000);
 const IDLE_TIMEOUT_MS = 250;
 
 let PortAudio = null;
@@ -66,6 +69,8 @@ export class AudioPlayer {
     this.started = false;
     this.stopped = false;
     this.onStateChange = typeof onStateChange === 'function' ? onStateChange : null;
+    this.prefillSamples = PREFILL_SAMPLES;
+    this.prefillTimer = null;
   }
 
   ensureStarted() {
@@ -79,6 +84,7 @@ export class AudioPlayer {
     this.timer = setInterval(() => this.flush(), Math.max(TICK_MS, 10));
     this.started = true;
     this.stopped = false;
+    this.clearPrefillTimer();
     this.notifyState('start');
   }
 
@@ -87,12 +93,18 @@ export class AudioPlayer {
     if (!(samples instanceof Int16Array)) {
       throw new Error('AudioPlayer.enqueue は Int16Array を期待します');
     }
-    this.ensureStarted();
     const resampled = resampleLinear(samples, sampleRate, PLAYBACK_SAMPLE_RATE);
     const normalized = normalize(resampled);
     if (normalized.length === 0) return;
     this.buffers.push(normalized);
     this.idleTimestamp = null;
+    if (!this.started) {
+      if (!this.prefillSamples || this.getBufferedSampleCount() >= this.prefillSamples) {
+        this.ensureStarted();
+      } else {
+        this.schedulePrefillStart();
+      }
+    }
   }
 
   flush() {
@@ -148,6 +160,7 @@ export class AudioPlayer {
       clearInterval(this.timer);
       this.timer = null;
     }
+    this.clearPrefillTimer();
     this.notifyState('stop');
   }
 
@@ -159,6 +172,7 @@ export class AudioPlayer {
       clearInterval(this.timer);
       this.timer = null;
     }
+    this.clearPrefillTimer();
     if (portAudioInitialized) {
       const pa = loadPortAudio();
       try {
@@ -174,6 +188,37 @@ export class AudioPlayer {
       this.onStateChange?.(state);
     } catch (error) {
       console.error(`[audio-player] 状態通知エラー: ${error.message}`);
+    }
+  }
+
+  getBufferedSampleCount() {
+    if (!this.buffers.length) {
+      return 0;
+    }
+    let total = -this.bufferOffset;
+    for (const buffer of this.buffers) {
+      total += buffer.length;
+    }
+    return total > 0 ? total : 0;
+  }
+
+  schedulePrefillStart() {
+    if (this.prefillTimer || !this.getBufferedSampleCount()) {
+      return;
+    }
+    const delay = Math.max(PREFILL_MS, 10);
+    this.prefillTimer = setTimeout(() => {
+      this.prefillTimer = null;
+      if (!this.started && !this.stopped && this.getBufferedSampleCount() > 0) {
+        this.ensureStarted();
+      }
+    }, delay);
+  }
+
+  clearPrefillTimer() {
+    if (this.prefillTimer) {
+      clearTimeout(this.prefillTimer);
+      this.prefillTimer = null;
     }
   }
 }
