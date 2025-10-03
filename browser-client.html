@@ -49,8 +49,14 @@
       gap: 8px;
       margin-top: 16px;
     }
-    .meter {
+    .meter-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
       margin-top: 20px;
+    }
+    .meter {
+      flex: 1 1 240px;
     }
     .meter-header {
       display: flex;
@@ -122,23 +128,24 @@
       <button id="interruptButton" disabled>応答停止</button>
     </div>
 
-    <div class="meter">
-      <div class="meter-header">
-        <span>送信レベル</span>
-        <span id="clientLevelValue">0%</span>
+    <div class="meter-row">
+      <div class="meter">
+        <div class="meter-header">
+          <span>送信レベル</span>
+          <span id="clientLevelValue">0%</span>
+        </div>
+        <div class="level-meter">
+          <div class="level-bar" id="clientLevelBar"></div>
+        </div>
       </div>
-      <div class="level-meter">
-        <div class="level-bar" id="clientLevelBar"></div>
-      </div>
-    </div>
-
-    <div class="meter">
-      <div class="meter-header">
-        <span>サーバー受信レベル</span>
-        <span id="serverLevelValue">0%</span>
-      </div>
-      <div class="level-meter">
-        <div class="level-bar" id="serverLevelBar"></div>
+      <div class="meter">
+        <div class="meter-header">
+          <span>サーバー受信レベル</span>
+          <span id="serverLevelValue">0%</span>
+        </div>
+        <div class="level-meter">
+          <div class="level-bar" id="serverLevelBar"></div>
+        </div>
       </div>
     </div>
 
