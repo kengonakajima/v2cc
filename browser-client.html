@@ -24,8 +24,6 @@
       max-width: 720px;
     }
     label {
-      display: block;
-      margin-top: 12px;
       font-weight: 600;
     }
     input, select, button {
@@ -113,15 +111,31 @@
       margin-bottom: 4px;
       word-break: break-word;
     }
+    .field-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .field-row label {
+      margin: 0;
+      white-space: nowrap;
+    }
+    .field-row select {
+      margin-top: 0;
+      flex: 1;
+      min-width: 200px;
+    }
   </style>
 </head>
 <body>
   <div class="panel">
     <h1>Voice Agent Browser Client</h1>
-    <p>ブラウザのマイク入力を WebSocket でサーバーへ送信します。</p>
 
-    <label for="deviceSelect">マイクデバイス</label>
-    <select id="deviceSelect"></select>
+    <div class="field-row">
+      <label for="deviceSelect">マイクデバイス</label>
+      <select id="deviceSelect"></select>
+    </div>
 
     <div class="controls">
       <button id="connectButton">WS 接続</button>
