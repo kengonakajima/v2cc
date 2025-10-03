@@ -16,7 +16,7 @@ import http from 'http';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 if (!OPENAI_API_KEY) {
-  console.error('OPENAI_API_KEY が設定されていません (.env で指定してください)');
+  console.error(`${formatLogTime()} OPENAI_API_KEY が設定されていません (.env で指定してください)`);
   process.exit(1);
 }
 
@@ -45,6 +45,7 @@ const TODOS_FILE_PATH = path.resolve(WORKSPACE_DIR, 'todos.json');
 const MSG_SEND_SOUND_PATH = path.resolve(__dirname, 'msgsnd.mp3');
 const WORK_SOUND_PATH = path.resolve(__dirname, 'work.mp3');
 const TO_LLM_SOUND_PATH = path.resolve(__dirname, 'to_llm.mp3');
+const DEFAULT_WORKSPACE_FILE = 'notes.txt';
 
 const todoState = {
   loaded: false,
@@ -60,7 +61,7 @@ let browserClientHtml = '';
 try {
   browserClientHtml = fs.readFileSync(browserClientPath, 'utf8');
 } catch (error) {
-  console.error(`[voice-agent] browser-client.html を読み込めませんでした: ${error.message}`);
+  console.error(`${formatLogTime()} [voice-agent] browser-client.html を読み込めませんでした: ${error.message}`);
 }
 
 const httpServer = http.createServer((req, res) => {
@@ -92,11 +93,11 @@ const httpServer = http.createServer((req, res) => {
 });
 
 httpServer.listen(HTTP_PORT, () => {
-  console.error(`[voice-agent] ブラウザクライアントを開く: http://localhost:${HTTP_PORT}/`);
+  console.error(`${formatLogTime()} [voice-agent] ブラウザクライアントを開く: http://localhost:${HTTP_PORT}/`);
 });
 
 httpServer.on('error', (error) => {
-  console.error(`[voice-agent] HTTP サーバーエラー: ${error.message}`);
+  console.error(`${formatLogTime()} [voice-agent] HTTP サーバーエラー: ${error.message}`);
 });
 
 let browserWsServer = null;
@@ -112,29 +113,29 @@ try {
     }
     browserClients.add(socket);
     sendTodosSnapshotToSocket(socket).catch((error) => {
-      console.error(`[voice-agent] TODO 初期送信失敗: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] TODO 初期送信失敗: ${error.message}`);
     });
     sendWorkspaceFilesSnapshotToSocket(socket).catch((error) => {
-      console.error(`[voice-agent] ファイル一覧初期送信失敗: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] ファイル一覧初期送信失敗: ${error.message}`);
     });
     socket.on('message', (data) => {
       handleBrowserSocketMessage(socket, data);
     });
     socket.on('error', (error) => {
-      console.error(`[voice-agent] ブラウザWSエラー: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] ブラウザWSエラー: ${error.message}`);
     });
     socket.on('close', () => {
       browserClients.delete(socket);
     });
   });
   browserWsServer.on('listening', () => {
-    console.error(`[voice-agent] ブラウザ音声 WebSocket: ws://localhost:${BROWSER_WS_PORT}/audio`);
+    console.error(`${formatLogTime()} [voice-agent] ブラウザ音声 WebSocket: ws://localhost:${BROWSER_WS_PORT}/audio`);
   });
   browserWsServer.on('error', (error) => {
-    console.error(`[voice-agent] ブラウザ WebSocket サーバーエラー: ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] ブラウザ WebSocket サーバーエラー: ${error.message}`);
   });
 } catch (error) {
-  console.error(`[voice-agent] ブラウザ用 WebSocket サーバーを開始できませんでした: ${error.message}`);
+  console.error(`${formatLogTime()} [voice-agent] ブラウザ用 WebSocket サーバーを開始できませんでした: ${error.message}`);
 }
 
 const ttsDisabledFlag = args.has('--no-tts');
@@ -159,7 +160,7 @@ if (!ttsDisabledFlag && !ttsEnvDisabled) {
       enabled: true,
     });
   } catch (error) {
-    console.error(`[voice-agent] TTS 初期化に失敗しました: ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] TTS 初期化に失敗しました: ${error.message}`);
   }
 }
 
@@ -187,6 +188,7 @@ const JAPANESE_POLITE_ENDINGS = new Set([
 
 const PARTIAL_STAGE_HINTS = new Set(['partial', 'delta', 'updated', 'created', 'in_progress']);
 const FINAL_STAGE_HINTS = new Set(['completed', 'complete', 'final', 'finished', 'done']);
+const USER_SEGMENT_WINDOW_MS = 10000;
 
 const conversation = [];
 const pendingUtterances = [];
@@ -194,6 +196,24 @@ let processingQueue = false;
 let shuttingDown = false;
 let realtimeSocket = null;
 let lastPartialTranscript = '';
+let recentSegments = [];
+let lastQueuedCombined = '';
+let lastQueuedTimestamp = 0;
+
+function formatLogTime() {
+  return new Date().toISOString();
+}
+
+function formatSegmentTimestamp(epochMs) {
+  if (!Number.isFinite(epochMs)) {
+    return '';
+  }
+  try {
+    return new Date(epochMs).toISOString();
+  } catch (error) {
+    return '';
+  }
+}
 
 const baseSystemPrompt =
   process.env.VOICE_AGENT_SYSTEM_PROMPT ??
@@ -203,9 +223,11 @@ const baseSystemPrompt =
     '- Speak in natural conversational Japanese. Avoid written list formatting, emojis, excessive symbols, or long strings of numbers. Keep responses brief.\n' +
     '- Prefer sentences no longer than about 30 Japanese characters; insert a line break before starting a new short sentence.\n' +
     '- 会議コンパニオンとして常に傾聴し、議事録はシステム側で自動保存される前提で振る舞う。\n' +
-  '- 明確な依頼やあなたの名前「SuperSlack」を含む直接の呼びかけがあり、しかも、「してください」とか「お願いします」「これをやって」といったような依頼の語尾が見つかったときだけ応答し、冒頭で依頼内容を手短に復唱してから答える。\n' +
-  '- また、「SuperSlack」を含む呼びかけで語尾が「して」や「ですか」で終わる場合も応答対象とする。\n' +
-    '- 復唱は、もとの依頼内容を一言一句繰り返す必要はなく、とても短い要約を言う。\n' +
+  '- 明確な依頼やあなたの名前「SuperSlack」を含む直接の呼びかけがあり、しかも、「してください」とか「お願いします」「これをやって」といったような依頼の語尾が見つかったとき、また、疑問符や「して」「言って」「教えて」「ですか」などが見つかった時に応答し、冒頭で依頼内容を手短に復唱してから答える。\n' +
+  '- 直前や直前以前の複数メッセージが名前への呼びかけや前置きだけで終わっている場合は、短時間内に続く後続メッセージも含めて同じ依頼として読み替え、まとまった意図が判明した時点で応答対象か判断する。\n' +
+  '- ユーザーの入力は、直近およそ10秒間の発話を ISO 8601 時刻付きで複数行に連結したもの。行は古い順に並び、最後の行が最新発話。最新行を主たる依頼として解釈し、すでに回答した内容を重複して述べない。\n' +
+  '- 保存やファイル操作の依頼でファイル名が示されない場合は、希望を簡潔に確認し、未指定のままなら workspace/files/notes.txt へ追記する方針を自分から提案する。\n' +
+  '- 復唱は、もとの依頼内容を一言一句繰り返す必要はなく、とても短い要約を言う。\n' +
     '- 依頼の文章が終わっていない、つまり。記号がないときは、依頼は完成していません。応答をせず待ちます。\n' +            
     '- 依頼が無い発話には応答メッセージを出さない。\n' +
     '- 不要な確認や促し（例: 「何かご用はありますか？」）を繰り返さない。\n' +
@@ -214,23 +236,23 @@ const baseSystemPrompt =
 addToConversation(createMessage('system', baseSystemPrompt));
 
 ensureTodosLoaded().then(() => {
-  console.log(`[voice-agent] TODO 初期化完了 (${todoState.todos.length} 件)`);
+  console.log(`${formatLogTime()} [voice-agent] TODO 初期化完了 (${todoState.todos.length} 件)`);
 });
 
 loadNotificationSound().catch((error) => {
-  console.error(`[voice-agent] 通知音初期化失敗: ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] 通知音初期化失敗: ${error.message}`);
 });
 
 loadWorkSound().catch((error) => {
-  console.error(`[voice-agent] ツール通知音初期化失敗: ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] ツール通知音初期化失敗: ${error.message}`);
 });
 
 loadToLlmSound().catch((error) => {
-  console.error(`[voice-agent] LLM送信音初期化失敗: ${error.message}`);
+  console.error(`${formatLogTime()} [voice-agent] LLM送信音初期化失敗: ${error.message}`);
 });
 
 startRealtime().catch((error) => {
-  console.error(`[voice-agent] Realtime 初期化エラー: ${error.message}`);
+  console.error(`${formatLogTime()} [voice-agent] Realtime 初期化エラー: ${error.message}`);
   initiateShutdown(1, null);
 });
 setupSignalHandlers();
@@ -239,7 +261,7 @@ function initiateShutdown(code, reason) {
   if (shuttingDown) return;
   shuttingDown = true;
   if (reason) {
-    console.error(reason);
+    console.error(`${formatLogTime()} ${reason}`);
   }
   const finalize = async () => {
     try {
@@ -248,7 +270,7 @@ function initiateShutdown(code, reason) {
       }
       realtimeSocket = null;
     } catch (error) {
-      console.error(`[voice-agent] Realtime 接続終了エラー: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] Realtime 接続終了エラー: ${error.message}`);
     }
     try {
       if (playbackQueue) {
@@ -272,7 +294,7 @@ function initiateShutdown(code, reason) {
         });
       }
     } catch (error) {
-      console.error(`[voice-agent] 終了処理エラー: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] 終了処理エラー: ${error.message}`);
     } finally {
       process.exit(code);
     }
@@ -290,11 +312,11 @@ function setupSignalHandlers() {
 }
 
 async function startRealtime() {
-  console.error('[voice-agent] Realtime API に接続しています...');
+  console.error(`${formatLogTime()} [voice-agent] Realtime API に接続しています...`);
   try {
     realtimeSocket = await connectToRealtimeAPI();
   } catch (error) {
-    console.error(`[voice-agent] Realtime API 接続失敗: ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] Realtime API 接続失敗: ${error.message}`);
     initiateShutdown(1, null);
     return;
   }
@@ -306,20 +328,20 @@ async function startRealtime() {
   });
 
   realtimeSocket.on('error', (error) => {
-    console.error(`[voice-agent] WebSocket エラー: ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] WebSocket エラー: ${error.message}`);
   });
 
   realtimeSocket.on('message', async (data) => {
     try {
       await handleRealtimeMessage(data);
     } catch (error) {
-      console.error(`[voice-agent] メッセージ処理エラー: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] メッセージ処理エラー: ${error.message}`);
     }
   });
 
   sendSessionConfiguration();
 
-  console.error('[voice-agent] ローカルマイク入力は削除されています。ブラウザ経由の音声のみを利用します。');
+  console.error(`${formatLogTime()} [voice-agent] ローカルマイク入力は削除されています。ブラウザ経由の音声のみを利用します。`);
 }
 
 async function connectToRealtimeAPI() {
@@ -439,7 +461,7 @@ function forwardAudioBase64(base64) {
     );
     return true;
   } catch (error) {
-    console.error(`[voice-agent] 音声フレーム転送エラー: ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] 音声フレーム転送エラー: ${error.message}`);
     return false;
   }
 }
@@ -452,7 +474,7 @@ function commitBrowserAudio() {
     realtimeSocket.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
     return true;
   } catch (error) {
-    console.error(`[voice-agent] 音声コミットエラー: ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] 音声コミットエラー: ${error.message}`);
     return false;
   }
 }
@@ -489,7 +511,7 @@ function broadcastToBrowserClients(payload) {
   try {
     message = JSON.stringify(payload);
   } catch (error) {
-    console.error(`[voice-agent] ブロードキャスト失敗 (JSON 化エラー): ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] ブロードキャスト失敗 (JSON 化エラー): ${error.message}`);
     return;
   }
   for (const client of browserClients) {
@@ -497,7 +519,7 @@ function broadcastToBrowserClients(payload) {
     try {
       client.send(message);
     } catch (error) {
-      console.error(`[voice-agent] ブラウザ送信エラー: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] ブラウザ送信エラー: ${error.message}`);
     }
   }
 }
@@ -564,7 +586,7 @@ function serializeTodos() {
 async function persistTodos() {
   const json = serializeTodos();
   return fs.promises.writeFile(TODOS_FILE_PATH, json, 'utf8').catch((error) => {
-    console.error(`[voice-agent] TODO 書き込み失敗: ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] TODO 書き込み失敗: ${error.message}`);
   });
 }
 
@@ -580,7 +602,7 @@ async function ensureTodosLoaded() {
     return;
   }
   await fs.promises.mkdir(WORKSPACE_DIR, { recursive: true }).catch((error) => {
-    console.error(`[voice-agent] TODO ディレクトリ作成失敗: ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] TODO ディレクトリ作成失敗: ${error.message}`);
   });
 
   await fs.promises
@@ -595,7 +617,7 @@ async function ensureTodosLoaded() {
         todoState.nextId = 1;
         return persistTodos();
       }
-      console.error(`[voice-agent] TODO 読み込み失敗: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] TODO 読み込み失敗: ${error.message}`);
       todoState.todos = [];
       todoState.nextId = 1;
       return persistTodos();
@@ -673,13 +695,13 @@ async function loadNotificationSound() {
     const data = await fs.promises.readFile(MSG_SEND_SOUND_PATH);
     if (data && data.length) {
       notificationSoundBase64 = data.toString('base64');
-      console.log('[voice-agent] 通知音を読み込みました');
+      console.log(`${formatLogTime()} [voice-agent] 通知音を読み込みました`);
     }
   } catch (error) {
     if (error && error.code === 'ENOENT') {
-      console.error(`[voice-agent] 通知音ファイルが見つかりません: ${MSG_SEND_SOUND_PATH}`);
+      console.error(`${formatLogTime()} [voice-agent] 通知音ファイルが見つかりません: ${MSG_SEND_SOUND_PATH}`);
     } else {
-      console.error(`[voice-agent] 通知音読み込み失敗: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] 通知音読み込み失敗: ${error.message}`);
     }
     notificationSoundBase64 = null;
   }
@@ -701,13 +723,13 @@ async function loadWorkSound() {
     const data = await fs.promises.readFile(WORK_SOUND_PATH);
     if (data && data.length) {
       workSoundBase64 = data.toString('base64');
-      console.log('[voice-agent] ツール通知音を読み込みました');
+      console.log(`${formatLogTime()} [voice-agent] ツール通知音を読み込みました`);
     }
   } catch (error) {
     if (error && error.code === 'ENOENT') {
-      console.error(`[voice-agent] ツール通知音ファイルが見つかりません: ${WORK_SOUND_PATH}`);
+      console.error(`${formatLogTime()} [voice-agent] ツール通知音ファイルが見つかりません: ${WORK_SOUND_PATH}`);
     } else {
-      console.error(`[voice-agent] ツール通知音読み込み失敗: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] ツール通知音読み込み失敗: ${error.message}`);
     }
     workSoundBase64 = null;
   }
@@ -729,13 +751,13 @@ async function loadToLlmSound() {
     const data = await fs.promises.readFile(TO_LLM_SOUND_PATH);
     if (data && data.length) {
       toLlmSoundBase64 = data.toString('base64');
-      console.log('[voice-agent] LLM送信音を読み込みました');
+      console.log(`${formatLogTime()} [voice-agent] LLM送信音を読み込みました`);
     }
   } catch (error) {
     if (error && error.code === 'ENOENT') {
-      console.error(`[voice-agent] LLM送信音ファイルが見つかりません: ${TO_LLM_SOUND_PATH}`);
+      console.error(`${formatLogTime()} [voice-agent] LLM送信音ファイルが見つかりません: ${TO_LLM_SOUND_PATH}`);
     } else {
-      console.error(`[voice-agent] LLM送信音読み込み失敗: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] LLM送信音読み込み失敗: ${error.message}`);
     }
     toLlmSoundBase64 = null;
   }
@@ -814,7 +836,7 @@ async function ensureWorkspaceFilesReady() {
     .mkdir(WORKSPACE_FILES_DIR, { recursive: true })
     .then(() => true)
     .catch((error) => {
-      console.error(`[voice-agent] 作業ファイル用ディレクトリを準備できませんでした: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] 作業ファイル用ディレクトリを準備できませんでした: ${error.message}`);
       return false;
     });
 }
@@ -853,6 +875,17 @@ function normalizeWorkspaceFilePath(rawPath) {
     absolutePath,
     relativePath,
   };
+}
+
+function applyDefaultWorkspacePath(rawPath) {
+  if (typeof rawPath !== 'string') {
+    return DEFAULT_WORKSPACE_FILE;
+  }
+  const trimmed = rawPath.trim();
+  if (!trimmed) {
+    return DEFAULT_WORKSPACE_FILE;
+  }
+  return trimmed;
 }
 
 function resolveWorkspaceDirectory(rawDirectory) {
@@ -940,7 +973,7 @@ async function collectWorkspaceFiles(absoluteDirectory) {
                 };
               })
               .catch((error) => {
-                console.error(`[voice-agent] 作業ファイルの stat に失敗しました (${entry.name}): ${error.message}`);
+                console.error(`${formatLogTime()} [voice-agent] 作業ファイルの stat に失敗しました (${entry.name}): ${error.message}`);
                 return null;
               });
           })
@@ -948,7 +981,7 @@ async function collectWorkspaceFiles(absoluteDirectory) {
     )
     .then((items) => items.filter(Boolean).sort((a, b) => a.displayPath.localeCompare(b.displayPath)))
     .catch((error) => {
-      console.error(`[voice-agent] 作業ファイル一覧の取得に失敗しました: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] 作業ファイル一覧の取得に失敗しました: ${error.message}`);
       return [];
     });
 }
@@ -999,7 +1032,7 @@ const workspaceFilesApi = {
       });
   },
   async read(pathFragment) {
-    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    const normalized = normalizeWorkspaceFilePath(applyDefaultWorkspacePath(pathFragment));
     if (!normalized) {
       return null;
     }
@@ -1011,12 +1044,12 @@ const workspaceFilesApi = {
       .readFile(normalized.absolutePath, 'utf8')
       .then((content) => ({ content, encoding: 'utf8' }))
       .catch((error) => {
-        console.error(`[voice-agent] 作業ファイル読み込み失敗 (${normalized.relativePath}): ${error.message}`);
+        console.error(`${formatLogTime()} [voice-agent] 作業ファイル読み込み失敗 (${normalized.relativePath}): ${error.message}`);
         return null;
       });
   },
   async stat(pathFragment) {
-    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    const normalized = normalizeWorkspaceFilePath(applyDefaultWorkspacePath(pathFragment));
     if (!normalized) {
       return null;
     }
@@ -1037,12 +1070,12 @@ const workspaceFilesApi = {
         if (error && error.code === 'ENOENT') {
           return { exists: false };
         }
-        console.error(`[voice-agent] 作業ファイル stat 取得失敗 (${normalized.relativePath}): ${error.message}`);
+        console.error(`${formatLogTime()} [voice-agent] 作業ファイル stat 取得失敗 (${normalized.relativePath}): ${error.message}`);
         return null;
       });
   },
   async write(pathFragment, content, mode) {
-    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    const normalized = normalizeWorkspaceFilePath(applyDefaultWorkspacePath(pathFragment));
     if (!normalized) {
       return { success: false };
     }
@@ -1060,12 +1093,12 @@ const workspaceFilesApi = {
         return { success: true, mode: writeMode };
       })
       .catch((error) => {
-        console.error(`[voice-agent] 作業ファイル書き込み失敗 (${normalized.relativePath}): ${error.message}`);
+        console.error(`${formatLogTime()} [voice-agent] 作業ファイル書き込み失敗 (${normalized.relativePath}): ${error.message}`);
         return { success: false };
       });
   },
   async create(pathFragment, content) {
-    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    const normalized = normalizeWorkspaceFilePath(applyDefaultWorkspacePath(pathFragment));
     if (!normalized) {
       return { success: false, error: 'invalid_path' };
     }
@@ -1084,12 +1117,12 @@ const workspaceFilesApi = {
         if (error && error.code === 'EEXIST') {
           return { success: false, error: 'already_exists' };
         }
-        console.error(`[voice-agent] 作業ファイル作成失敗 (${normalized.relativePath}): ${error.message}`);
+        console.error(`${formatLogTime()} [voice-agent] 作業ファイル作成失敗 (${normalized.relativePath}): ${error.message}`);
         return { success: false };
       });
   },
   async delete(pathFragment) {
-    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    const normalized = normalizeWorkspaceFilePath(applyDefaultWorkspacePath(pathFragment));
     if (!normalized) {
       return { success: false };
     }
@@ -1107,12 +1140,12 @@ const workspaceFilesApi = {
         if (error && error.code === 'ENOENT') {
           return { success: false, error: 'not_found' };
         }
-        console.error(`[voice-agent] 作業ファイル削除失敗 (${normalized.relativePath}): ${error.message}`);
+        console.error(`${formatLogTime()} [voice-agent] 作業ファイル削除失敗 (${normalized.relativePath}): ${error.message}`);
         return { success: false };
       });
   },
   async search(pathFragment, pattern, useRegex) {
-    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    const normalized = normalizeWorkspaceFilePath(applyDefaultWorkspacePath(pathFragment));
     if (!normalized) {
       return [];
     }
@@ -1123,7 +1156,7 @@ const workspaceFilesApi = {
     const data = await fs.promises
       .readFile(normalized.absolutePath, 'utf8')
       .catch((error) => {
-        console.error(`[voice-agent] 作業ファイル検索用読み込み失敗 (${normalized.relativePath}): ${error.message}`);
+        console.error(`${formatLogTime()} [voice-agent] 作業ファイル検索用読み込み失敗 (${normalized.relativePath}): ${error.message}`);
         return null;
       });
     if (data == null) {
@@ -1134,7 +1167,7 @@ const workspaceFilesApi = {
       try {
         regex = new RegExp(pattern, 'g');
       } catch (error) {
-        console.error(`[voice-agent] 正規表現の構築に失敗しました (${pattern}): ${error.message}`);
+        console.error(`${formatLogTime()} [voice-agent] 正規表現の構築に失敗しました (${pattern}): ${error.message}`);
         return [];
       }
       const matches = [];
@@ -1159,7 +1192,7 @@ const workspaceFilesApi = {
     return matches;
   },
   async replace(pathFragment, pattern, replacement, useRegex) {
-    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    const normalized = normalizeWorkspaceFilePath(applyDefaultWorkspacePath(pathFragment));
     if (!normalized) {
       return { replaced: 0 };
     }
@@ -1170,7 +1203,7 @@ const workspaceFilesApi = {
     const original = await fs.promises
       .readFile(normalized.absolutePath, 'utf8')
       .catch((error) => {
-        console.error(`[voice-agent] 作業ファイル置換用読み込み失敗 (${normalized.relativePath}): ${error.message}`);
+        console.error(`${formatLogTime()} [voice-agent] 作業ファイル置換用読み込み失敗 (${normalized.relativePath}): ${error.message}`);
         return null;
       });
     if (original == null) {
@@ -1183,7 +1216,7 @@ const workspaceFilesApi = {
       try {
         regex = new RegExp(pattern, 'g');
       } catch (error) {
-        console.error(`[voice-agent] 正規表現の構築に失敗しました (${pattern}): ${error.message}`);
+        console.error(`${formatLogTime()} [voice-agent] 正規表現の構築に失敗しました (${pattern}): ${error.message}`);
         return { replaced: 0 };
       }
       updated = original.replace(regex, (...args) => {
@@ -1207,7 +1240,7 @@ const workspaceFilesApi = {
         return { replaced: replaceCount };
       })
       .catch((error) => {
-        console.error(`[voice-agent] 作業ファイル置換書き込み失敗 (${normalized.relativePath}): ${error.message}`);
+        console.error(`${formatLogTime()} [voice-agent] 作業ファイル置換書き込み失敗 (${normalized.relativePath}): ${error.message}`);
         return { replaced: 0 };
       });
   },
@@ -1241,9 +1274,9 @@ async function logMeetingNote(text, isoTimestamp) {
   const timestamp = isoTimestamp ?? new Date().toISOString();
   try {
     await fs.promises.appendFile(MEETING_NOTES_PATH, `[${timestamp}] ${trimmed}\n`, 'utf8');
-    console.log(`[meeting-note] saved ${timestamp} -> ${trimmed}`);
+    console.log(`${formatLogTime()} [meeting-note] saved ${timestamp} -> ${trimmed}`);
   } catch (error) {
-    console.error(`[voice-agent] 議事録書き込み失敗: ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] 議事録書き込み失敗: ${error.message}`);
     return;
   }
   broadcastToBrowserClients({ type: 'meeting_record', text: trimmed, timestamp });
@@ -1256,19 +1289,59 @@ async function handleRealtimeMessage(data) {
   try {
     message = JSON.parse(data.toString());
   } catch (error) {
-    console.error(`[voice-agent] メッセージ解析エラー: ${error.message}`);
+    console.error(`${formatLogTime()} [voice-agent] メッセージ解析エラー: ${error.message}`);
     return;
   }
   if (await handleTranscriptionEnvelope(message)) {
     return;
   }
   if (message.type === 'error') {
-    console.error(`[voice-agent] API エラー: ${message.error?.message ?? '詳細不明'}`);
+    console.error(`${formatLogTime()} [voice-agent] API エラー: ${message.error?.message ?? '詳細不明'}`);
   }
 }
 
 function enqueueUtterance(utterance) {
-  pendingUtterances.push(utterance);
+  if (!utterance || !utterance.text) {
+    return;
+  }
+
+  const text = utterance.text.trim();
+  if (!text) {
+    return;
+  }
+
+  const timestamp = typeof utterance.timestamp === 'number' && Number.isFinite(utterance.timestamp)
+    ? utterance.timestamp
+    : Date.now();
+
+  recentSegments.push({ text, timestamp });
+  const cutoff = timestamp - USER_SEGMENT_WINDOW_MS;
+  recentSegments = recentSegments.filter((segment) => segment.timestamp >= cutoff);
+
+  if (timestamp - lastQueuedTimestamp > USER_SEGMENT_WINDOW_MS) {
+    lastQueuedCombined = '';
+  }
+
+  const combined = recentSegments
+    .slice()
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .map((segment) => {
+      const iso = formatSegmentTimestamp(segment.timestamp);
+      if (iso) {
+        return `[${iso}] ${segment.text}`;
+      }
+      return segment.text;
+    })
+    .join('\n')
+    .trim();
+
+  if (!combined || combined === lastQueuedCombined) {
+    return;
+  }
+
+  pendingUtterances.push({ text: combined, timestamp });
+  lastQueuedCombined = combined;
+  lastQueuedTimestamp = timestamp;
   if (!processingQueue) {
     processQueue();
   }
@@ -1282,7 +1355,7 @@ async function processQueue() {
       continue;
     }
     await runTurn(item).catch((error) => {
-      console.error(`[voice-agent] モデル処理エラー: ${error.message}`);
+      console.error(`${formatLogTime()} [voice-agent] モデル処理エラー: ${error.message}`);
     });
   }
   processingQueue = false;
@@ -1294,7 +1367,7 @@ async function runTurn({ text, timestamp }) {
     return;
   }
 
-  console.log(`[voice-agent] LLM へ送信: ${trimmed}`);
+  console.log(`${formatLogTime()} [voice-agent] LLM へ送信: ${trimmed}`);
   broadcastToLlmSound();
   addToConversation(createMessage('user', trimmed));
 
@@ -1303,6 +1376,7 @@ async function runTurn({ text, timestamp }) {
   while (continueLoop && iteration < MAX_TOOL_ITERATIONS) {
     let textOutputs = [];
     let toolCalls = [];
+    const toolResponses = [];
 
     if (LLM_PROVIDER === 'groq') {
       ({ textOutputs, toolCalls } = await generateGroqOutputs({
@@ -1320,16 +1394,32 @@ async function runTurn({ text, timestamp }) {
       }));
     }
 
+    let assistantEmitted = false;
     for (const output of textOutputs) {
       const text = typeof output === 'string' ? output.trim() : '';
       if (!text || SILENT_RESPONSES.has(text)) {
         continue;
       }
-      console.log(`[assistant] ${text}`);
+      console.log(`${formatLogTime()} [assistant] ${text}`);
       addToConversation(createMessage('assistant', text));
       broadcastToBrowserClients({ type: 'assistant_text', text });
       broadcastNotificationSound();
       playbackQueue?.enqueue({ text });
+      assistantEmitted = true;
+    }
+
+    if (!assistantEmitted) {
+      const fallbackText = createAssistantFallbackFromTools(toolResponses);
+      if (fallbackText) {
+        console.log(`${formatLogTime()} [assistant] ${fallbackText}`);
+        addToConversation(createMessage('assistant', fallbackText));
+        broadcastToBrowserClients({ type: 'assistant_text', text: fallbackText });
+        broadcastNotificationSound();
+        playbackQueue?.enqueue({ text: fallbackText });
+        assistantEmitted = true;
+      } else {
+        console.log(`${formatLogTime()} [assistant] empty`);
+      }
     }
 
     if (!toolCalls.length) {
@@ -1363,15 +1453,27 @@ async function runTurn({ text, timestamp }) {
         call_id: toolOutput.call_id,
         output: toolOutput.output,
       });
-      console.log(`[tool:${call.name}] ${toolOutput.output}`);
+      console.log(`${formatLogTime()} [tool:${call.name}] ${toolOutput.output}`);
       broadcastWorkSound();
+
+      let parsedOutput = null;
+      try {
+        parsedOutput = JSON.parse(toolOutput.output);
+      } catch (error) {
+        parsedOutput = null;
+      }
+      toolResponses.push({
+        name: call.name,
+        data: parsedOutput,
+        raw: toolOutput.output,
+      });
     }
 
     iteration += 1;
   }
 
   if (iteration >= MAX_TOOL_ITERATIONS) {
-    console.error('[voice-agent] ツール呼び出しの繰り返し上限に達しました');
+    console.error(`${formatLogTime()} [voice-agent] ツール呼び出しの繰り返し上限に達しました`);
   }
 }
 
@@ -1430,6 +1532,74 @@ function ensureTrailingPunctuation(text) {
   return trimmed;
 }
 
+function createAssistantFallbackFromTools(responses) {
+  if (!Array.isArray(responses) || responses.length === 0) {
+    return null;
+  }
+
+  const fragments = [];
+
+  for (const response of responses) {
+    if (!response || typeof response !== 'object') {
+      continue;
+    }
+    const { name, data, raw } = response;
+    if (!name) {
+      continue;
+    }
+
+    if (data && typeof data === 'object') {
+      if (name === 'weather') {
+        const forecast = typeof data.forecast === 'string' ? data.forecast : null;
+        const location = typeof data.location === 'string' ? data.location : null;
+        const locationLabel = location ? location : '指定地域';
+        if (forecast) {
+          fragments.push(`天気は、${locationLabel}で${forecast}です。`);
+          continue;
+        }
+      }
+
+      if (name === 'list_files' && Array.isArray(data.files)) {
+        const files = data.files;
+        if (files.length === 0) {
+          fragments.push('ファイルはありません。');
+        } else {
+          const sample = files.slice(0, 5).join('、');
+          const suffix = files.length > 5 ? ` 他${files.length - 5}件` : '';
+          fragments.push(`ファイルは${files.length}件あります。${sample}${suffix}`);
+        }
+        continue;
+      }
+
+      if (name === 'read_file' && typeof data.content === 'string') {
+        const snippet = data.content.length > 120 ? `${data.content.slice(0, 120)}…` : data.content;
+        fragments.push(`ファイル内容は次の通りです: ${snippet}`);
+        continue;
+      }
+
+      if (typeof data.error === 'string') {
+        fragments.push(`ツール${name}でエラー: ${data.error}`);
+        continue;
+      }
+
+      if (typeof data.success === 'boolean') {
+        fragments.push(`ツール${name}は${data.success ? '成功しました' : '失敗しました' }。`);
+        continue;
+      }
+    }
+
+    if (raw) {
+      fragments.push(`ツール${name}の結果: ${raw}`);
+    }
+  }
+
+  if (!fragments.length) {
+    return null;
+  }
+
+  return fragments.join(' ');
+}
+
 function logPartial(text) {
   if (!text) return;
   if (text === lastPartialTranscript) return;
@@ -1444,7 +1614,7 @@ async function handleFinalTranscript(raw) {
   }
   lastPartialTranscript = '';
   process.stdout.write('\r');
-  console.log(`[speech:final] ${normalized}`);
+  console.log(`${formatLogTime()} [speech:final] ${normalized}`);
   const occurredAtIso = new Date().toISOString();
   await logMeetingNote(normalized, occurredAtIso);
   enqueueUtterance({ text: normalized, timestamp: Date.now() });
