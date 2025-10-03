@@ -103,11 +103,30 @@
       font-size: 1.1rem;
       margin: 0 0 8px;
     }
+    .files {
+      margin-top: 16px;
+      padding: 12px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      background: #fafafa;
+    }
+    .files h2 {
+      font-size: 1.1rem;
+      margin: 0 0 8px;
+    }
     #todoList {
       margin: 0;
       padding-left: 20px;
     }
     #todoList li {
+      margin-bottom: 4px;
+      word-break: break-word;
+    }
+    #fileList {
+      margin: 0;
+      padding-left: 20px;
+    }
+    #fileList li {
       margin-bottom: 4px;
       word-break: break-word;
     }
@@ -168,6 +187,11 @@
       <ul id="todoList"></ul>
     </div>
 
+    <div class="files">
+      <h2>ファイル一覧</h2>
+      <ul id="fileList"></ul>
+    </div>
+
     <div id="log"></div>
   </div>
 
@@ -181,6 +205,7 @@
     const clientLevelValue = document.getElementById('clientLevelValue');
     const serverLevelValue = document.getElementById('serverLevelValue');
     const todoListElement = document.getElementById('todoList');
+    const fileListElement = document.getElementById('fileList');
 
     const TARGET_SAMPLE_RATE = 24000;
     const CHUNK_SIZE = 4096;
@@ -434,6 +459,43 @@
       });
     }
 
+    function formatFileSize(size) {
+      if (!Number.isFinite(size)) {
+        return 'サイズ不明';
+      }
+      if (size < 1024) {
+        return `${size} B`;
+      }
+      const kb = size / 1024;
+      if (kb < 1024) {
+        return `${kb.toFixed(1)} KB`;
+      }
+      const mb = kb / 1024;
+      if (mb < 1024) {
+        return `${mb.toFixed(1)} MB`;
+      }
+      const gb = mb / 1024;
+      return `${gb.toFixed(1)} GB`;
+    }
+
+    function renderFiles(files) {
+      const list = Array.isArray(files) ? files : [];
+      fileListElement.innerHTML = '';
+      if (list.length === 0) {
+        const emptyItem = document.createElement('li');
+        emptyItem.textContent = 'ファイルはありません';
+        fileListElement.appendChild(emptyItem);
+        return;
+      }
+      list.forEach((file) => {
+        const name = typeof file.name === 'string' && file.name.trim() ? file.name.trim() : '(名称不明)';
+        const sizeValue = formatFileSize(Number(file.size));
+        const item = document.createElement('li');
+        item.textContent = `${name} (${sizeValue})`;
+        fileListElement.appendChild(item);
+      });
+    }
+
     function handleServerMessage(raw) {
       let payload;
       try {
@@ -468,6 +530,12 @@
           const todos = Array.isArray(payload.todos) ? payload.todos : [];
           appendLog(`TODO更新: ${todos.length}件`);
           renderTodos(todos);
+          break;
+        }
+        case 'workspace_files_sync': {
+          const files = Array.isArray(payload.files) ? payload.files : [];
+          appendLog(`ファイル更新: ${files.length}件`);
+          renderFiles(files);
           break;
         }
         case 'audio_notification':

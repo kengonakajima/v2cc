@@ -1,0 +1,38 @@
+# voice-agent.js  エージェントがワークスペースのファイルを扱えるようにする
+
+
+現状は workspace/todos.json だけが存在していますが、
+workspace/files/ に、仕事用のファイルを保存でき、
+それを使って作業ができるようにします。
+ディレクトリ操作は実装しません。
+
+
+## 応答用LLMに与えるツール群
+
+
+読み取り系ツールは、
+
+- read_file(path: string) → string  :   指定したファイルをテキストとして読み込む。まずテキストのみ
+- list_files(directory: string, glob?: string) → string[] : ディレクトリの中身を列挙。
+- stat_file(path: string) → {size, mtime, ctime, type} : ファイルの存在確認、更新日時、サイズ取得。
+
+書き込み系は、
+
+- write_file(path: string, content: string, mode: "overwrite"|"append" = "overwrite")  :  void  ファイルを作成／上書き／追記する。
+- create_file(path: string, content?: string) :  void 空ファイルを生成する。
+- delete_file(path: string) → void :  ファイル削除。
+
+検索と編集系は、
+
+- search_in_file(path: string, pattern: string, regex: boolean = true) → string[] : ファイル内で文字列／正規表現検索。
+- replace_in_file(path: string, pattern: string, replacement: string) → void : 検索置換。
+
+
+## クライアントでの表示
+
+クライアントでは、TODOリストの次にファイル一覧を表示する。ファイル名とサイズだけ表示する。 ディレクトリはないので、ツリー表示にする必要はない。
+
+WS接続したら、ファイルのリストをクライアントに送る。
+
+ファイル操作のツールが呼び出されてファイルの状態が変わったら、最新のファイルリストをクライアントに送って表示を更新する。
+

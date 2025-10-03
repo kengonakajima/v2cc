@@ -40,9 +40,11 @@ const HTTP_PORT = Number.parseInt(process.env.VOICE_AGENT_HTTP_PORT ?? '3000', 1
 const BROWSER_WS_PORT = Number.parseInt(process.env.VOICE_AGENT_BROWSER_WS_PORT ?? '8080', 10);
 const MEETING_NOTES_PATH = path.resolve(__dirname, 'meeting-notes.log');
 const WORKSPACE_DIR = path.resolve(__dirname, 'workspace');
+const WORKSPACE_FILES_DIR = path.resolve(WORKSPACE_DIR, 'files');
 const TODOS_FILE_PATH = path.resolve(WORKSPACE_DIR, 'todos.json');
 const MSG_SEND_SOUND_PATH = path.resolve(__dirname, 'msgsnd.mp3');
 const WORK_SOUND_PATH = path.resolve(__dirname, 'work.mp3');
+const TO_LLM_SOUND_PATH = path.resolve(__dirname, 'to_llm.mp3');
 
 const todoState = {
   loaded: false,
@@ -52,6 +54,7 @@ const todoState = {
 
 let notificationSoundBase64 = null;
 let workSoundBase64 = null;
+let toLlmSoundBase64 = null;
 
 let browserClientHtml = '';
 try {
@@ -110,6 +113,9 @@ try {
     browserClients.add(socket);
     sendTodosSnapshotToSocket(socket).catch((error) => {
       console.error(`[voice-agent] TODO 初期送信失敗: ${error.message}`);
+    });
+    sendWorkspaceFilesSnapshotToSocket(socket).catch((error) => {
+      console.error(`[voice-agent] ファイル一覧初期送信失敗: ${error.message}`);
     });
     socket.on('message', (data) => {
       handleBrowserSocketMessage(socket, data);
@@ -197,7 +203,8 @@ const baseSystemPrompt =
     '- Speak in natural conversational Japanese. Avoid written list formatting, emojis, excessive symbols, or long strings of numbers. Keep responses brief.\n' +
     '- Prefer sentences no longer than about 30 Japanese characters; insert a line break before starting a new short sentence.\n' +
     '- 会議コンパニオンとして常に傾聴し、議事録はシステム側で自動保存される前提で振る舞う。\n' +
-    '- 明確な依頼やあなたの名前「SuperSlack」を含む直接の呼びかけがあるときだけ応答し、冒頭で依頼内容を手短に復唱してから答える。\n' +
+  '- 明確な依頼やあなたの名前「SuperSlack」を含む直接の呼びかけがあり、しかも、「してください」とか「お願いします」「これをやって」といったような依頼の語尾が見つかったときだけ応答し、冒頭で依頼内容を手短に復唱してから答える。\n' +
+  '- また、「SuperSlack」を含む呼びかけで語尾が「して」や「ですか」で終わる場合も応答対象とする。\n' +
     '- 復唱は、もとの依頼内容を一言一句繰り返す必要はなく、とても短い要約を言う。\n' +
     '- 依頼の文章が終わっていない、つまり。記号がないときは、依頼は完成していません。応答をせず待ちます。\n' +            
     '- 依頼が無い発話には応答メッセージを出さない。\n' +
@@ -216,6 +223,10 @@ loadNotificationSound().catch((error) => {
 
 loadWorkSound().catch((error) => {
   console.error(`[voice-agent] ツール通知音初期化失敗: ${error.message}`);
+});
+
+loadToLlmSound().catch((error) => {
+  console.error(`[voice-agent] LLM送信音初期化失敗: ${error.message}`);
 });
 
 startRealtime().catch((error) => {
@@ -713,6 +724,34 @@ function broadcastWorkSound() {
   });
 }
 
+async function loadToLlmSound() {
+  try {
+    const data = await fs.promises.readFile(TO_LLM_SOUND_PATH);
+    if (data && data.length) {
+      toLlmSoundBase64 = data.toString('base64');
+      console.log('[voice-agent] LLM送信音を読み込みました');
+    }
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      console.error(`[voice-agent] LLM送信音ファイルが見つかりません: ${TO_LLM_SOUND_PATH}`);
+    } else {
+      console.error(`[voice-agent] LLM送信音読み込み失敗: ${error.message}`);
+    }
+    toLlmSoundBase64 = null;
+  }
+}
+
+function broadcastToLlmSound() {
+  if (!toLlmSoundBase64) {
+    return;
+  }
+  broadcastToBrowserClients({
+    type: 'audio_notification',
+    format: 'mp3',
+    audio: toLlmSoundBase64,
+  });
+}
+
 async function getTodoSnapshot() {
   await ensureTodosLoaded();
   return todoState.todos.map(cloneTodoEntry);
@@ -767,6 +806,410 @@ const todoApi = {
       await broadcastTodosSnapshot();
     }
     return todo;
+  },
+};
+
+async function ensureWorkspaceFilesReady() {
+  return fs.promises
+    .mkdir(WORKSPACE_FILES_DIR, { recursive: true })
+    .then(() => true)
+    .catch((error) => {
+      console.error(`[voice-agent] 作業ファイル用ディレクトリを準備できませんでした: ${error.message}`);
+      return false;
+    });
+}
+
+function normalizeWorkspaceFilePath(rawPath) {
+  if (typeof rawPath !== 'string') {
+    return null;
+  }
+  let trimmed = rawPath.trim();
+  if (!trimmed) {
+    return null;
+  }
+  trimmed = trimmed.replace(/\\/g, '/');
+  if (trimmed.startsWith('./')) {
+    trimmed = trimmed.slice(2);
+  }
+  if (trimmed.startsWith('files/')) {
+    trimmed = trimmed.slice(6);
+  }
+  if (trimmed.startsWith('/')) {
+    trimmed = trimmed.slice(1);
+  }
+  if (!trimmed) {
+    return null;
+  }
+  const hasParentRef = trimmed.split('/').some((segment) => segment === '..' || !segment);
+  if (hasParentRef) {
+    return null;
+  }
+  const absolutePath = path.resolve(WORKSPACE_FILES_DIR, trimmed);
+  const relativePath = path.relative(WORKSPACE_FILES_DIR, absolutePath);
+  if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    return null;
+  }
+  return {
+    absolutePath,
+    relativePath,
+  };
+}
+
+function resolveWorkspaceDirectory(rawDirectory) {
+  if (rawDirectory == null) {
+    return WORKSPACE_FILES_DIR;
+  }
+  let directory = String(rawDirectory).trim();
+  if (!directory || directory === '.' || directory === './') {
+    return WORKSPACE_FILES_DIR;
+  }
+  directory = directory.replace(/\\/g, '/');
+  if (directory.startsWith('files/')) {
+    directory = directory.slice(6);
+  }
+  if (directory.startsWith('/')) {
+    directory = directory.slice(1);
+  }
+  if (!directory) {
+    return null;
+  }
+  const hasParentRef = directory.split('/').some((segment) => segment === '..' || !segment);
+  if (hasParentRef) {
+    return null;
+  }
+  const absolute = path.resolve(WORKSPACE_FILES_DIR, directory);
+  const relative = path.relative(WORKSPACE_FILES_DIR, absolute);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    return null;
+  }
+  return absolute;
+}
+
+function toWorkspaceDisplayPath(relativePath) {
+  return relativePath.split(path.sep).join('/');
+}
+
+function createGlobTester(pattern) {
+  if (typeof pattern !== 'string') {
+    return null;
+  }
+  const trimmed = pattern.trim();
+  if (!trimmed) {
+    return null;
+  }
+  let source = '';
+  for (let i = 0; i < trimmed.length; i += 1) {
+    const char = trimmed[i];
+    if (char === '*') {
+      const next = trimmed[i + 1];
+      if (next === '*') {
+        source += '.*';
+        i += 1;
+      } else {
+        source += '[^/]*';
+      }
+    } else if (char === '?') {
+      source += '.';
+    } else {
+      source += char.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+    }
+  }
+  return new RegExp(`^${source}$`);
+}
+
+async function collectWorkspaceFiles(absoluteDirectory) {
+  return fs.promises
+    .readdir(absoluteDirectory, { withFileTypes: true })
+    .then((entries) =>
+      Promise.all(
+        entries
+          .filter((entry) => entry.isFile())
+          .map((entry) => {
+            const absolutePath = path.join(absoluteDirectory, entry.name);
+            return fs.promises
+              .stat(absolutePath)
+              .then((stats) => {
+                const relativePath = path.relative(WORKSPACE_FILES_DIR, absolutePath);
+                return {
+                  relativePath,
+                  displayPath: toWorkspaceDisplayPath(relativePath),
+                  size: stats.size,
+                  ctime: stats.ctime,
+                  mtime: stats.mtime,
+                  type: 'file',
+                };
+              })
+              .catch((error) => {
+                console.error(`[voice-agent] 作業ファイルの stat に失敗しました (${entry.name}): ${error.message}`);
+                return null;
+              });
+          })
+      )
+    )
+    .then((items) => items.filter(Boolean).sort((a, b) => a.displayPath.localeCompare(b.displayPath)))
+    .catch((error) => {
+      console.error(`[voice-agent] 作業ファイル一覧の取得に失敗しました: ${error.message}`);
+      return [];
+    });
+}
+
+async function getWorkspaceFilesSnapshot() {
+  const ready = await ensureWorkspaceFilesReady();
+  if (!ready) {
+    return [];
+  }
+  return collectWorkspaceFiles(WORKSPACE_FILES_DIR);
+}
+
+async function broadcastWorkspaceFilesSnapshot() {
+  const files = await getWorkspaceFilesSnapshot();
+  const simplified = files.map((entry) => ({ name: entry.displayPath, size: entry.size }));
+  broadcastToBrowserClients({ type: 'workspace_files_sync', files: simplified });
+}
+
+async function sendWorkspaceFilesSnapshotToSocket(socket) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  const files = await getWorkspaceFilesSnapshot();
+  const simplified = files.map((entry) => ({ name: entry.displayPath, size: entry.size }));
+  const message = JSON.stringify({ type: 'workspace_files_sync', files: simplified });
+  socket.send(message);
+}
+
+const workspaceFilesApi = {
+  async list(directory, globPattern) {
+    const ready = await ensureWorkspaceFilesReady();
+    if (!ready) {
+      return [];
+    }
+    const targetDirectory = resolveWorkspaceDirectory(directory);
+    if (!targetDirectory) {
+      return [];
+    }
+    const entries = await collectWorkspaceFiles(targetDirectory);
+    const matcher = createGlobTester(globPattern);
+    return entries
+      .map((entry) => entry.displayPath)
+      .filter((name) => {
+        if (!matcher) {
+          return true;
+        }
+        return matcher.test(name);
+      });
+  },
+  async read(pathFragment) {
+    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    if (!normalized) {
+      return null;
+    }
+    const ready = await ensureWorkspaceFilesReady();
+    if (!ready) {
+      return null;
+    }
+    return fs.promises
+      .readFile(normalized.absolutePath, 'utf8')
+      .then((content) => ({ content, encoding: 'utf8' }))
+      .catch((error) => {
+        console.error(`[voice-agent] 作業ファイル読み込み失敗 (${normalized.relativePath}): ${error.message}`);
+        return null;
+      });
+  },
+  async stat(pathFragment) {
+    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    if (!normalized) {
+      return null;
+    }
+    const ready = await ensureWorkspaceFilesReady();
+    if (!ready) {
+      return null;
+    }
+    return fs.promises
+      .stat(normalized.absolutePath)
+      .then((stats) => ({
+        exists: true,
+        size: stats.size,
+        mtime: stats.mtime.toISOString(),
+        ctime: stats.ctime.toISOString(),
+        type: stats.isFile() ? 'file' : 'other',
+      }))
+      .catch((error) => {
+        if (error && error.code === 'ENOENT') {
+          return { exists: false };
+        }
+        console.error(`[voice-agent] 作業ファイル stat 取得失敗 (${normalized.relativePath}): ${error.message}`);
+        return null;
+      });
+  },
+  async write(pathFragment, content, mode) {
+    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    if (!normalized) {
+      return { success: false };
+    }
+    const ready = await ensureWorkspaceFilesReady();
+    if (!ready) {
+      return { success: false };
+    }
+    const writeMode = mode === 'append' ? 'append' : 'overwrite';
+    const operation = writeMode === 'append'
+      ? fs.promises.appendFile(normalized.absolutePath, content ?? '', 'utf8')
+      : fs.promises.writeFile(normalized.absolutePath, content ?? '', 'utf8');
+    return operation
+      .then(async () => {
+        await broadcastWorkspaceFilesSnapshot();
+        return { success: true, mode: writeMode };
+      })
+      .catch((error) => {
+        console.error(`[voice-agent] 作業ファイル書き込み失敗 (${normalized.relativePath}): ${error.message}`);
+        return { success: false };
+      });
+  },
+  async create(pathFragment, content) {
+    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    if (!normalized) {
+      return { success: false, error: 'invalid_path' };
+    }
+    const ready = await ensureWorkspaceFilesReady();
+    if (!ready) {
+      return { success: false };
+    }
+    return fs.promises
+      .open(normalized.absolutePath, 'wx')
+      .then((handle) => handle.writeFile(content ?? '', 'utf8').finally(() => handle.close()))
+      .then(async () => {
+        await broadcastWorkspaceFilesSnapshot();
+        return { success: true };
+      })
+      .catch((error) => {
+        if (error && error.code === 'EEXIST') {
+          return { success: false, error: 'already_exists' };
+        }
+        console.error(`[voice-agent] 作業ファイル作成失敗 (${normalized.relativePath}): ${error.message}`);
+        return { success: false };
+      });
+  },
+  async delete(pathFragment) {
+    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    if (!normalized) {
+      return { success: false };
+    }
+    const ready = await ensureWorkspaceFilesReady();
+    if (!ready) {
+      return { success: false };
+    }
+    return fs.promises
+      .unlink(normalized.absolutePath)
+      .then(async () => {
+        await broadcastWorkspaceFilesSnapshot();
+        return { success: true };
+      })
+      .catch((error) => {
+        if (error && error.code === 'ENOENT') {
+          return { success: false, error: 'not_found' };
+        }
+        console.error(`[voice-agent] 作業ファイル削除失敗 (${normalized.relativePath}): ${error.message}`);
+        return { success: false };
+      });
+  },
+  async search(pathFragment, pattern, useRegex) {
+    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    if (!normalized) {
+      return [];
+    }
+    const ready = await ensureWorkspaceFilesReady();
+    if (!ready) {
+      return [];
+    }
+    const data = await fs.promises
+      .readFile(normalized.absolutePath, 'utf8')
+      .catch((error) => {
+        console.error(`[voice-agent] 作業ファイル検索用読み込み失敗 (${normalized.relativePath}): ${error.message}`);
+        return null;
+      });
+    if (data == null) {
+      return [];
+    }
+    if (useRegex) {
+      let regex;
+      try {
+        regex = new RegExp(pattern, 'g');
+      } catch (error) {
+        console.error(`[voice-agent] 正規表現の構築に失敗しました (${pattern}): ${error.message}`);
+        return [];
+      }
+      const matches = [];
+      let execResult;
+      while ((execResult = regex.exec(data)) !== null) {
+        matches.push(execResult[0]);
+        if (regex.lastIndex === execResult.index) {
+          regex.lastIndex += 1;
+        }
+      }
+      return matches;
+    }
+    if (typeof pattern !== 'string' || !pattern) {
+      return [];
+    }
+    const matches = [];
+    let searchIndex = data.indexOf(pattern);
+    while (searchIndex !== -1) {
+      matches.push(pattern);
+      searchIndex = data.indexOf(pattern, searchIndex + pattern.length);
+    }
+    return matches;
+  },
+  async replace(pathFragment, pattern, replacement, useRegex) {
+    const normalized = normalizeWorkspaceFilePath(pathFragment);
+    if (!normalized) {
+      return { replaced: 0 };
+    }
+    const ready = await ensureWorkspaceFilesReady();
+    if (!ready) {
+      return { replaced: 0 };
+    }
+    const original = await fs.promises
+      .readFile(normalized.absolutePath, 'utf8')
+      .catch((error) => {
+        console.error(`[voice-agent] 作業ファイル置換用読み込み失敗 (${normalized.relativePath}): ${error.message}`);
+        return null;
+      });
+    if (original == null) {
+      return { replaced: 0 };
+    }
+    let updated = original;
+    let replaceCount = 0;
+    if (useRegex) {
+      let regex;
+      try {
+        regex = new RegExp(pattern, 'g');
+      } catch (error) {
+        console.error(`[voice-agent] 正規表現の構築に失敗しました (${pattern}): ${error.message}`);
+        return { replaced: 0 };
+      }
+      updated = original.replace(regex, (...args) => {
+        replaceCount += 1;
+        return replacement ?? '';
+      });
+    } else if (typeof pattern === 'string' && pattern) {
+      const pieces = original.split(pattern);
+      if (pieces.length > 1) {
+        replaceCount = pieces.length - 1;
+        updated = pieces.join(replacement ?? '');
+      }
+    }
+    if (replaceCount === 0) {
+      return { replaced: 0 };
+    }
+    return fs.promises
+      .writeFile(normalized.absolutePath, updated, 'utf8')
+      .then(async () => {
+        await broadcastWorkspaceFilesSnapshot();
+        return { replaced: replaceCount };
+      })
+      .catch((error) => {
+        console.error(`[voice-agent] 作業ファイル置換書き込み失敗 (${normalized.relativePath}): ${error.message}`);
+        return { replaced: 0 };
+      });
   },
 };
 
@@ -852,6 +1295,7 @@ async function runTurn({ text, timestamp }) {
   }
 
   console.log(`[voice-agent] LLM へ送信: ${trimmed}`);
+  broadcastToLlmSound();
   addToConversation(createMessage('user', trimmed));
 
   let iteration = 0;
@@ -898,6 +1342,7 @@ async function runTurn({ text, timestamp }) {
       timestamp,
       conversationSize: conversation.length,
       todoApi,
+      workspaceFilesApi,
     };
 
     for (const call of toolCalls) {

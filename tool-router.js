@@ -127,6 +127,179 @@ const TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
+  {
+    type: 'function',
+    name: 'read_file',
+    description: '指定したワークスペースファイルのテキスト内容を読み込みます。',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'workspace/files からの相対パス。',
+        },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'list_files',
+    description: 'ワークスペース内のファイル一覧を取得します。',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        directory: {
+          type: 'string',
+          description: '列挙対象のディレクトリ (省略時はルート)。',
+        },
+        glob: {
+          type: 'string',
+          description: 'オプションの簡易グロブパターン。',
+        },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'stat_file',
+    description: 'ファイルの存在確認とサイズ・更新日時を返します。',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'workspace/files からの相対パス。',
+        },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'write_file',
+    description: 'ファイルへテキストを書き込みます (上書きまたは追記)。',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'workspace/files からの相対パス。',
+        },
+        content: {
+          type: 'string',
+          description: '書き込むテキスト。',
+        },
+        mode: {
+          type: 'string',
+          enum: ['overwrite', 'append'],
+          description: '書き込みモード (既定は overwrite)。',
+        },
+      },
+      required: ['path', 'content'],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'create_file',
+    description: '新しいファイルを作成します (既存の場合はエラー)。',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'workspace/files からの相対パス。',
+        },
+        content: {
+          type: 'string',
+          description: '初期内容 (省略可)。',
+        },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'delete_file',
+    description: '指定したファイルを削除します。',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'workspace/files からの相対パス。',
+        },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'search_in_file',
+    description: 'ファイル内で文字列または正規表現検索を行います。',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'workspace/files からの相対パス。',
+        },
+        pattern: {
+          type: 'string',
+          description: '検索パターン。',
+        },
+        regex: {
+          type: 'boolean',
+          description: 'true で正規表現検索 (既定 true)。',
+        },
+      },
+      required: ['path', 'pattern'],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: 'function',
+    name: 'replace_in_file',
+    description: 'ファイル内の文字列または正規表現を置換します。',
+    strict: false,
+    parameters: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'workspace/files からの相対パス。',
+        },
+        pattern: {
+          type: 'string',
+          description: '検索パターン。',
+        },
+        replacement: {
+          type: 'string',
+          description: '置換後のテキスト。',
+        },
+        regex: {
+          type: 'boolean',
+          description: 'true で正規表現置換 (既定 true)。',
+        },
+      },
+      required: ['path', 'pattern', 'replacement'],
+      additionalProperties: false,
+    },
+  },
 ];
 
 const TOOL_HANDLERS = {
@@ -212,6 +385,89 @@ const TOOL_HANDLERS = {
     }
     return api.list().then((todos) => ({ todos }));
   },
+  async read_file(args = {}, context = {}) {
+    const api = resolveWorkspaceFilesApi(context);
+    if (!api) {
+      return { error: 'workspace files unavailable' };
+    }
+    const pathFragment = typeof args.path === 'string' ? args.path : '';
+    const result = await api.read(pathFragment);
+    if (!result) {
+      return { error: 'read failed' };
+    }
+    return result;
+  },
+  async list_files(args = {}, context = {}) {
+    const api = resolveWorkspaceFilesApi(context);
+    if (!api) {
+      return { error: 'workspace files unavailable' };
+    }
+    const directory = typeof args.directory === 'string' ? args.directory : undefined;
+    const glob = typeof args.glob === 'string' ? args.glob : undefined;
+    const files = await api.list(directory, glob);
+    return { files };
+  },
+  async stat_file(args = {}, context = {}) {
+    const api = resolveWorkspaceFilesApi(context);
+    if (!api) {
+      return { error: 'workspace files unavailable' };
+    }
+    const pathFragment = typeof args.path === 'string' ? args.path : '';
+    const stats = await api.stat(pathFragment);
+    if (!stats) {
+      return { error: 'stat failed' };
+    }
+    return stats;
+  },
+  async write_file(args = {}, context = {}) {
+    const api = resolveWorkspaceFilesApi(context);
+    if (!api) {
+      return { error: 'workspace files unavailable' };
+    }
+    const pathFragment = typeof args.path === 'string' ? args.path : '';
+    const content = typeof args.content === 'string' ? args.content : '';
+    const mode = typeof args.mode === 'string' ? args.mode : undefined;
+    return api.write(pathFragment, content, mode);
+  },
+  async create_file(args = {}, context = {}) {
+    const api = resolveWorkspaceFilesApi(context);
+    if (!api) {
+      return { error: 'workspace files unavailable' };
+    }
+    const pathFragment = typeof args.path === 'string' ? args.path : '';
+    const content = typeof args.content === 'string' ? args.content : undefined;
+    return api.create(pathFragment, content);
+  },
+  async delete_file(args = {}, context = {}) {
+    const api = resolveWorkspaceFilesApi(context);
+    if (!api) {
+      return { error: 'workspace files unavailable' };
+    }
+    const pathFragment = typeof args.path === 'string' ? args.path : '';
+    return api.delete(pathFragment);
+  },
+  async search_in_file(args = {}, context = {}) {
+    const api = resolveWorkspaceFilesApi(context);
+    if (!api) {
+      return { error: 'workspace files unavailable' };
+    }
+    const pathFragment = typeof args.path === 'string' ? args.path : '';
+    const pattern = typeof args.pattern === 'string' ? args.pattern : '';
+    const regexFlag = args.regex === undefined ? true : Boolean(args.regex);
+    const matches = await api.search(pathFragment, pattern, regexFlag);
+    return { matches };
+  },
+  async replace_in_file(args = {}, context = {}) {
+    const api = resolveWorkspaceFilesApi(context);
+    if (!api) {
+      return { error: 'workspace files unavailable' };
+    }
+    const pathFragment = typeof args.path === 'string' ? args.path : '';
+    const pattern = typeof args.pattern === 'string' ? args.pattern : '';
+    const replacement = typeof args.replacement === 'string' ? args.replacement : '';
+    const regexFlag = args.regex === undefined ? true : Boolean(args.regex);
+    return api.replace(pathFragment, pattern, replacement, regexFlag);
+  },
 };
 
 export function getToolDefinitions() {
@@ -267,4 +523,27 @@ function deriveCorrelation(toolCorrelationId, context) {
   const hash = createHash('sha1');
   hash.update(transcript);
   return hash.digest('hex').slice(0, 12);
+}
+
+function resolveWorkspaceFilesApi(context) {
+  if (!context || typeof context !== 'object') {
+    return null;
+  }
+  const api = context.workspaceFilesApi;
+  if (!api || typeof api !== 'object') {
+    return null;
+  }
+  const hasMethods =
+    typeof api.list === 'function' &&
+    typeof api.read === 'function' &&
+    typeof api.stat === 'function' &&
+    typeof api.write === 'function' &&
+    typeof api.create === 'function' &&
+    typeof api.delete === 'function' &&
+    typeof api.search === 'function' &&
+    typeof api.replace === 'function';
+  if (!hasMethods) {
+    return null;
+  }
+  return api;
 }
