@@ -114,22 +114,11 @@
     <h1>Voice Agent Browser Client</h1>
     <p>ブラウザのマイク入力を WebSocket でサーバーへ送信します。</p>
 
-    <div class="controls">
-      <button id="permissionButton">マイク許可をリクエスト</button>
-      <button id="refreshButton">デバイス再取得</button>
-    </div>
-
     <label for="deviceSelect">マイクデバイス</label>
     <select id="deviceSelect"></select>
 
     <div class="controls">
       <button id="connectButton">WS 接続</button>
-      <button id="disconnectButton" disabled>WS 切断</button>
-    </div>
-
-    <div class="controls">
-      <button id="startButton" disabled>送信開始</button>
-      <button id="stopButton" disabled>送信停止</button>
       <button id="interruptButton" disabled>応答停止</button>
     </div>
 
@@ -163,13 +152,8 @@
 
   <script>
     const logArea = document.getElementById('log');
-    const permissionButton = document.getElementById('permissionButton');
-    const refreshButton = document.getElementById('refreshButton');
     const deviceSelect = document.getElementById('deviceSelect');
     const connectButton = document.getElementById('connectButton');
-    const disconnectButton = document.getElementById('disconnectButton');
-    const startButton = document.getElementById('startButton');
-    const stopButton = document.getElementById('stopButton');
     const interruptButton = document.getElementById('interruptButton');
     const clientLevelBar = document.getElementById('clientLevelBar');
     const serverLevelBar = document.getElementById('serverLevelBar');
@@ -236,14 +220,29 @@
       });
     }
 
-    function requestMicrophonePermission() {
-      navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
-        appendLog('マイク許可が付与されました');
-        stream.getTracks().forEach((track) => track.stop());
-        ensureDeviceOptions();
-      }).catch((error) => {
-        appendLog(`マイク許可が拒否されました: ${error.message}`);
-      });
+    function requestMicrophonePermission({ log = true } = {}) {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        if (log) {
+          appendLog('このブラウザは getUserMedia をサポートしていません');
+        }
+        return Promise.resolve(false);
+      }
+      return navigator.mediaDevices
+        .getUserMedia({ audio: true })
+        .then((stream) => {
+          if (log) {
+            appendLog('マイク許可が付与されました');
+          }
+          stream.getTracks().forEach((track) => track.stop());
+          ensureDeviceOptions();
+          return true;
+        })
+        .catch((error) => {
+          if (log) {
+            appendLog(`マイク許可が拒否されました: ${error.message}`);
+          }
+          return false;
+        });
     }
 
     function openWebSocket() {
@@ -254,17 +253,15 @@
       }
       ws = new WebSocket(url);
       connectButton.disabled = true;
-      disconnectButton.disabled = false;
-      startButton.disabled = true;
       appendLog(`WebSocket 接続中: ${url}`);
 
       ws.addEventListener('open', () => {
         appendLog('WebSocket 接続が開きました');
-        startButton.disabled = false;
         interruptButton.disabled = false;
         playbackSuspended = false;
         interruptButton.textContent = '応答停止';
         sendStreamConfig();
+        startStreaming();
       });
 
       ws.addEventListener('message', (event) => {
@@ -285,10 +282,8 @@
     }
 
     function cleanupWebSocket() {
+      stopStreaming();
       connectButton.disabled = false;
-      disconnectButton.disabled = true;
-      startButton.disabled = true;
-      stopButton.disabled = true;
       interruptButton.disabled = true;
       stopAllPlayback();
       playbackSuspended = false;
@@ -365,8 +360,6 @@
         sourceNode.connect(processorNode);
         processorNode.connect(recordingContext.destination);
         appendLog('音声送信を開始しました');
-        startButton.disabled = true;
-        stopButton.disabled = false;
       }).catch((error) => {
         appendLog(`音声取得に失敗しました: ${error.message}`);
       });
@@ -395,25 +388,27 @@
         ws.send(JSON.stringify(endMessage));
       }
       appendLog('音声送信を停止しました');
-      startButton.disabled = false;
-      stopButton.disabled = true;
       updateClientLevel(0);
       updateServerLevel(0);
       stopAllPlayback();
     }
 
     function renderTodos(todos) {
+      const list = Array.isArray(todos) ? todos : [];
       todoListElement.innerHTML = '';
-      if (!Array.isArray(todos) || todos.length === 0) {
+      if (list.length === 0) {
         const emptyItem = document.createElement('li');
         emptyItem.textContent = 'TODO はありません';
         todoListElement.appendChild(emptyItem);
         return;
       }
-      todos.forEach((todo) => {
+      list.forEach((todo) => {
         const item = document.createElement('li');
         const status = todo.done ? '✅' : '⬜️';
-        item.textContent = `${status} [${todo.id}] ${todo.description}`;
+        const desc = typeof todo.description === 'string' && todo.description.trim()
+          ? todo.description
+          : '(説明なし)';
+        item.textContent = `${status} [${todo.id}] ${desc}`;
         todoListElement.appendChild(item);
       });
     }
@@ -448,9 +443,12 @@
             appendLog(`AI: ${payload.text}`);
           }
           break;
-        case 'todos_sync':
-          renderTodos(payload.todos);
+        case 'todos_sync': {
+          const todos = Array.isArray(payload.todos) ? payload.todos : [];
+          appendLog(`TODO更新: ${todos.length}件`);
+          renderTodos(todos);
           break;
+        }
         case 'audio_notification':
           enqueueNotificationPlayback(payload);
           break;
@@ -668,23 +666,18 @@
       }
     }
 
-    permissionButton.addEventListener('click', requestMicrophonePermission);
-    refreshButton.addEventListener('click', ensureDeviceOptions);
     deviceSelect.addEventListener('change', handleDeviceSelectionChange);
-    connectButton.addEventListener('click', () => {
+    connectButton.addEventListener('click', async () => {
       ensurePlaybackContext();
+      await requestMicrophonePermission({ log: true });
       openWebSocket();
     });
-    disconnectButton.addEventListener('click', () => {
-      stopStreaming();
-      closeWebSocket();
-    });
-    startButton.addEventListener('click', startStreaming);
-    stopButton.addEventListener('click', stopStreaming);
+    // 切断ボタンは削除されたため手動切断は未提供
     interruptButton.addEventListener('click', togglePlaybackSuspension);
 
     if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
       ensureDeviceOptions();
+      requestMicrophonePermission({ log: false });
     } else {
       appendLog('このブラウザは mediaDevices API をサポートしていません');
     }
