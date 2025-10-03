@@ -850,6 +850,12 @@ function normalizeWorkspaceFilePath(rawPath) {
     return null;
   }
   trimmed = trimmed.replace(/\\/g, '/');
+  if (trimmed.startsWith('workspace/files/')) {
+    trimmed = trimmed.slice('workspace/files/'.length);
+  }
+  if (trimmed === 'workspace/files') {
+    trimmed = '';
+  }
   if (trimmed.startsWith('./')) {
     trimmed = trimmed.slice(2);
   }
@@ -897,6 +903,14 @@ function resolveWorkspaceDirectory(rawDirectory) {
     return WORKSPACE_FILES_DIR;
   }
   directory = directory.replace(/\\/g, '/');
+  if (directory.startsWith('workspace/files/')) {
+    directory = directory.slice('workspace/files/'.length);
+  } else if (directory === 'workspace/files') {
+    directory = '';
+  }
+  if (directory === '') {
+    return WORKSPACE_FILES_DIR;
+  }
   if (directory.startsWith('files/')) {
     directory = directory.slice(6);
   }
